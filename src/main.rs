@@ -81,6 +81,8 @@ struct State {
     interval: u32,
     /// Show what's left instead of what's used.
     show_left: bool,
+    /// Rate-limit errors in a row; each one doubles the wait.
+    rate_limited: u32,
 }
 
 thread_local! {
@@ -88,7 +90,7 @@ thread_local! {
         ctl: null_mut(), widget: null_mut(), tip: null_mut(), taskbar: null_mut(),
         taskbar_created_msg: 0, usage: None, last_ok: None, error: None,
         fetching: false, hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
-        interval: DEFAULT_INTERVAL, show_left: false,
+        interval: DEFAULT_INTERVAL, show_left: false, rate_limited: 0,
     });
 }
 
@@ -178,28 +180,35 @@ fn start_fetch() {
 fn on_result(r: Result<api::Usage, api::FetchError>) {
     let next_secs = with(|s| {
         s.fetching = false;
+        let limited = matches!(r, Err(api::FetchError::RateLimited));
         match r {
             Ok(u) => {
                 s.usage = Some(u);
                 s.last_ok = Some(now());
                 s.error = None;
-                s.interval
             }
-            Err(e) => {
-                s.error = Some(e.message());
-                match e {
-                    api::FetchError::RateLimited => s.interval.max(300),
-                    api::FetchError::Busy => 15,
-                    api::FetchError::Other(_) => s.interval.min(60),
-                    _ => s.interval.max(120),
-                }
-            }
+            Err(e) => s.error = Some(e.message()),
         }
+        if limited {
+            s.rate_limited += 1;
+        } else {
+            s.rate_limited = 0;
+        }
+        backoff_secs(s.interval, s.rate_limited)
     });
     let ctl = with(|s| s.ctl);
     unsafe { SetTimer(ctl, T_FETCH, next_secs * 1000, None) };
     ensure_widget();
     update_tooltip();
+}
+
+/// Wait before the next fetch. Normally the user's interval. After rate-limit
+/// errors in a row it doubles each time, up to 10 minutes (never below the
+/// user's interval).
+fn backoff_secs(interval: u32, rate_limited: u32) -> u32 {
+    const MAX_BACKOFF: u32 = 600;
+    let grown = interval.saturating_mul(1 << rate_limited.min(10));
+    grown.min(MAX_BACKOFF).max(interval)
 }
 
 fn is_stale(s: &State) -> bool {
@@ -576,7 +585,12 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 T_TICK => {
                     update_tooltip();
                     // A window just reset: fetch now instead of waiting.
+                    // Not while the last fetch failed: that would retry every
+                    // 30 seconds and skip the backoff set in on_result.
                     let reset_passed = with(|s| {
+                        if s.error.is_some() {
+                            return false;
+                        }
                         let u = s.usage.unwrap_or_default();
                         [u.five_hour, u.weekly].iter().flatten().any(|l| {
                             l.resets_at.is_some_and(|t| t < now() && s.last_ok.is_some_and(|ok| ok < t))
