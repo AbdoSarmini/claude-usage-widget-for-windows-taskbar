@@ -52,10 +52,21 @@ pub fn palette(dark: bool) -> Palette {
 
 pub const CLAUDE_ORANGE: Rgba = Rgba(0.851, 0.467, 0.341, 1.0); // #D97757
 
-pub struct Model {
+/// One account's numbers.
+pub struct Row {
     pub five: Option<f64>,
     pub week: Option<f64>,
     pub stale: bool,
+}
+
+/// Most accounts that fit in one column.
+pub const MAX_ROWS_PER_COLUMN: usize = 3;
+/// The "Default" font size; other sizes scale relative to it.
+pub const DEFAULT_FONT_SIZE: u32 = 14;
+
+pub struct Model {
+    /// One per account, laid out top to bottom, then left to right.
+    pub rows: Vec<Row>,
     pub hover: bool,
     pub dark: bool,
     /// Show what's left (100 - used) instead of what's used.
@@ -64,6 +75,10 @@ pub struct Model {
     pub font_size: u32,
     /// Leave out the Claude mark.
     pub hide_icon: bool,
+    /// Leave out the `5h` / `W` labels, showing only the numbers.
+    pub hide_labels: bool,
+    /// Accounts stacked per column (1 to MAX_ROWS_PER_COLUMN); more start a new column.
+    pub rows_per_col: usize,
 }
 
 pub struct Frame {
@@ -123,15 +138,48 @@ struct Seg {
     bold: bool,
     x: i32,
     w: i32,
+    /// Vertical band of the account row this text belongs to.
+    y0: i32,
+    y1: i32,
     color: Rgba,
+}
+
+struct Divider {
+    x: i32,
+    y0: i32,
+    y1: i32,
 }
 
 /// Renders the widget for a taskbar of height `h` at `scale` (DPI / 96).
 pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let pal = palette(m.dark);
     let s = |v: f32| (v * scale).round() as i32;
+    let empty = [Row { five: None, week: None, stale: false }];
+    let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
+    let rows_per_col = m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN);
+    let per_col = rows.len().min(rows_per_col);
+    // One account uses the full height like before; stacked accounts share
+    // it, with a small margin, and the text shrinks to fit.
+    let (band_top, row_h) = if per_col == 1 {
+        (0.0, h as f32)
+    } else {
+        let margin = s(1.0) as f32;
+        (margin, (h as f32 - 2.0 * margin) / per_col as f32)
+    };
+    let row_band = |r: usize| -> (i32, i32) {
+        let y0 = (band_top + r as f32 * row_h).round() as i32;
+        let y1 = (band_top + (r + 1) as f32 * row_h).round() as i32;
+        (y0, y1.min(h))
+    };
     unsafe {
-        let font_px = s(m.font_size as f32);
+        let mut font_px = s(m.font_size as f32);
+        if per_col > 1 {
+            // Stacked rows: the Default size fills most of a row, and the
+            // other sizes scale from there, never taller than the row or
+            // larger than they'd be on a single row.
+            let fit = row_h * 0.8 * m.font_size as f32 / DEFAULT_FONT_SIZE as f32;
+            font_px = font_px.min(fit.min(row_h).round() as i32).max(1);
+        }
         let f_label = make_font(font_px, &["Segoe UI Variable Text", "Segoe UI"]);
         let f_value = make_font(font_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);
 
@@ -143,34 +191,75 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             sz.cx
         };
 
-        let dim = |c: Rgba| if m.stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
+        let dim = |stale: bool, c: Rgba| if stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
+        let all_stale = rows.iter().all(|r| r.stale);
         let pad_l = s(8.0);
         let icon = if m.hide_icon { 0 } else { s(18.0) };
         let gap_icon = if m.hide_icon { 0 } else { s(7.0) };
-        let gap_lv = s(5.0);
+        let gap_lv = if m.hide_labels { 0 } else { s(5.0) };
         let gap_div = s(10.0);
         let div_w = s(1.0).max(1);
         let pad_r = s(4.0);
+        let div_h = if per_col == 1 { s(20.0) } else { (row_h as i32 - s(2.0)).max(1) };
 
         let mut x = pad_l;
         let icon_x = x;
         x += icon + gap_icon;
         let mut segs = Vec::new();
         let mut dividers = Vec::new();
-        let groups = [("5h", m.five), ("W", m.week)];
-        for (gi, (label, val)) in groups.iter().enumerate() {
-            for (text, bold, color, gap) in [
-                (label.to_string(), false, pal.label, gap_lv),
-                (value_text(*val, m.show_left), true, dim(value_color(*val, &pal)), gap_div),
-            ] {
-                let t: Vec<u16> = text.encode_utf16().collect();
-                let w = measure(&t, if bold { f_value } else { f_label });
-                segs.push(Seg { text: t, bold, x, w, color });
-                x += w + gap;
+        let enc = |t: &str| -> Vec<u16> { t.encode_utf16().collect() };
+        let columns: Vec<&[Row]> = rows.chunks(rows_per_col).collect();
+        for (ci, col) in columns.iter().enumerate() {
+            // Line the column's rows up: each field is as wide as its widest value.
+            let labels = [enc("5h"), enc("W")];
+            let label_w = if m.hide_labels {
+                [0, 0]
+            } else {
+                [measure(&labels[0], f_label), measure(&labels[1], f_label)]
+            };
+            let values: Vec<[Vec<u16>; 2]> = col
+                .iter()
+                .map(|r| [enc(&value_text(r.five, m.show_left)), enc(&value_text(r.week, m.show_left))])
+                .collect();
+            let mut value_w = [0; 2];
+            for v in &values {
+                for g in 0..2 {
+                    value_w[g] = value_w[g].max(measure(&v[g], f_value));
+                }
             }
-            dividers.push(x);
-            x += div_w;
-            if gi == 0 {
+            let mut group_x = [0; 2];
+            let mut div_x = [0; 2];
+            for g in 0..2 {
+                group_x[g] = x;
+                x += label_w[g] + gap_lv + value_w[g] + gap_div;
+                div_x[g] = x;
+                x += div_w;
+                if g == 0 {
+                    x += gap_div;
+                }
+            }
+            for (ri, (row, vals)) in col.iter().zip(&values).enumerate() {
+                let (y0, y1) = row_band(ri);
+                for g in 0..2 {
+                    let val = if g == 0 { row.five } else { row.week };
+                    if !m.hide_labels {
+                        segs.push(Seg { text: labels[g].clone(), bold: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label });
+                    }
+                    let vw = measure(&vals[g], f_value);
+                    segs.push(Seg {
+                        text: vals[g].clone(),
+                        bold: true,
+                        x: group_x[g] + label_w[g] + gap_lv,
+                        w: vw,
+                        y0,
+                        y1,
+                        color: dim(row.stale, value_color(val, &pal)),
+                    });
+                    let dy = y0 + ((y1 - y0) - div_h) / 2;
+                    dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
+                }
+            }
+            if ci + 1 < columns.len() {
                 x += gap_div;
             }
         }
@@ -196,7 +285,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         SetTextColor(dc, 0x00FFFFFF);
         for seg in &segs {
             SelectObject(dc, if seg.bold { f_value } else { f_label });
-            let mut rc = RECT { left: seg.x, top: 0, right: seg.x + seg.w + s(2.0), bottom: h };
+            let mut rc = RECT { left: seg.x, top: seg.y0, right: seg.x + seg.w + s(2.0), bottom: seg.y1 };
             DrawTextW(dc, seg.text.as_ptr(), seg.text.len() as i32, &mut rc,
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
         }
@@ -240,11 +329,9 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         }
 
         // Dividers.
-        let dh = s(20.0);
-        let dy = (h - dh) / 2;
-        for &dx in &dividers {
-            for y in dy..dy + dh {
-                for xx in dx..dx + div_w {
+        for d in &dividers {
+            for y in d.y0..d.y1 {
+                for xx in d.x..d.x + div_w {
                     over(&mut buf, (y * w + xx) as usize, pal.divider, 1.0);
                 }
             }
@@ -256,13 +343,13 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         for y in 0..icon {
             for xx in 0..icon {
                 let cov = mark[(y * icon + xx) as usize];
-                over(&mut buf, ((iy + y) * w + icon_x + xx) as usize, dim(CLAUDE_ORANGE), cov);
+                over(&mut buf, ((iy + y) * w + icon_x + xx) as usize, dim(all_stale, CLAUDE_ORANGE), cov);
             }
         }
 
         // Text.
         for seg in &segs {
-            for y in 0..h {
+            for y in seg.y0.max(0)..seg.y1.min(h) {
                 for xx in seg.x.max(0)..(seg.x + seg.w + s(2.0)).min(w) {
                     let i = (y * w + xx) as usize;
                     let cov = mask[i] as f32 / 255.0;
