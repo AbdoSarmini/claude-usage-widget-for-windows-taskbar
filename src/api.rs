@@ -7,7 +7,7 @@
 use crate::http;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -60,7 +60,9 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
-fn claude_dir() -> PathBuf {
+/// The folder Claude Code uses when started plainly: `CLAUDE_CONFIG_DIR`,
+/// or `%USERPROFILE%\.claude`.
+pub fn default_dir() -> PathBuf {
     if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
@@ -70,8 +72,38 @@ fn claude_dir() -> PathBuf {
     PathBuf::from(home).join(".claude")
 }
 
-fn creds_path() -> PathBuf {
-    claude_dir().join(".credentials.json")
+fn creds_path(dir: &Path) -> PathBuf {
+    dir.join(".credentials.json")
+}
+
+/// True if `dir` holds a Claude Code login.
+pub fn has_login(dir: &Path) -> bool {
+    creds_path(dir).is_file()
+}
+
+/// A name for the account in `dir`: its email from Claude Code's
+/// `.claude.json`, or the folder name.
+pub fn account_label(dir: &Path) -> String {
+    // With CLAUDE_CONFIG_DIR, `.claude.json` sits inside the folder;
+    // for the default `~/.claude` it sits next to it, in the home folder.
+    let mut candidates = vec![dir.join(".claude.json")];
+    if dir.file_name().is_some_and(|n| n.eq_ignore_ascii_case(".claude")) {
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join(".claude.json"));
+        }
+    }
+    for path in candidates {
+        let email = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v["oauthAccount"]["emailAddress"].as_str().map(str::to_string));
+        if let Some(e) = email.filter(|e| !e.is_empty()) {
+            return e;
+        }
+    }
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 struct Creds {
@@ -81,8 +113,8 @@ struct Creds {
     expires_at: Option<i64>,
 }
 
-fn load_creds() -> Result<Creds, FetchError> {
-    let text = fs::read_to_string(creds_path()).map_err(|_| FetchError::NoLogin)?;
+fn load_creds(dir: &Path) -> Result<Creds, FetchError> {
+    let text = fs::read_to_string(creds_path(dir)).map_err(|_| FetchError::NoLogin)?;
     let root: Value = serde_json::from_str(&text).map_err(|_| FetchError::NoLogin)?;
     let o = &root["claudeAiOauth"];
     let access = o["accessToken"].as_str().ok_or(FetchError::NoLogin)?.to_string();
@@ -129,14 +161,13 @@ impl Drop for DirLock {
 
 /// Refreshes the login. `rejected` is the token the server just refused
 /// (forces a refresh even if it doesn't look expired yet).
-fn refresh(rejected: Option<&str>) -> Result<String, FetchError> {
-    let dir = claude_dir();
+fn refresh(dir: &Path, rejected: Option<&str>) -> Result<String, FetchError> {
     let _lock = DirLock::acquire(dir.join(".oauth_refresh.lock")).ok_or(FetchError::Busy)?;
     let legacy = PathBuf::from(format!("{}.lock", dir.display()));
     let _legacy_lock = DirLock::acquire(legacy).ok_or(FetchError::Busy)?;
 
     // Re-read under the lock: someone else may have refreshed already.
-    let mut c = load_creds()?;
+    let mut c = load_creds(dir)?;
     match rejected {
         Some(bad) if c.access != bad => return Ok(c.access),
         None if !needs_refresh(&c) => return Ok(c.access),
@@ -193,7 +224,7 @@ fn refresh(rejected: Option<&str>) -> Result<String, FetchError> {
         o["refreshTokenExpiresAt"] = json!(keep);
     }
     // Atomic replace so Claude Code never sees a half-written file.
-    let path = creds_path();
+    let path = creds_path(dir);
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     fs::write(&tmp, serde_json::to_vec(&c.root).unwrap())
         .and_then(|_| fs::rename(&tmp, &path))
@@ -217,12 +248,13 @@ fn get_usage(token: &str) -> Result<http::Response, FetchError> {
     .map_err(FetchError::Other)
 }
 
-pub fn fetch() -> Result<Usage, FetchError> {
-    let c = load_creds()?;
-    let mut token = if needs_refresh(&c) { refresh(None)? } else { c.access };
+/// Fetches usage for the Claude Code login stored in `dir`.
+pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
+    let c = load_creds(dir)?;
+    let mut token = if needs_refresh(&c) { refresh(dir, None)? } else { c.access };
     let mut resp = get_usage(&token)?;
     if resp.status == 401 {
-        token = refresh(Some(&token))?;
+        token = refresh(dir, Some(&token))?;
         resp = get_usage(&token)?;
     }
     match resp.status {

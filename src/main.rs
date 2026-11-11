@@ -3,14 +3,17 @@
 mod api;
 mod http;
 mod render;
+mod update;
 
 use http::wide;
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -18,21 +21,34 @@ use windows_sys::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_N
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::Shell::{
+    SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+    BROWSEINFOW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::w;
 
 const WM_APP_RESULT: u32 = WM_APP + 1;
+const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
+const WM_APP_UPDATE: u32 = WM_APP + 3; // update check or install finished; lparam: Box<UpdateMsg>
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
-const T_FETCH: usize = 2; // one-shot: next usage fetch
 const T_TICK: usize = 3; // refreshes tooltip countdowns
+const T_UPDATE: usize = 4; // one-shot: next check for a new release
+const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
 
 const ID_REFRESH: usize = 1;
 const ID_OPEN: usize = 2;
+const ID_CSWAP: usize = 9;
+const ID_UPDATE: usize = 10;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
 const ID_HIDE_ICON: usize = 6;
+const ID_HIDE_LABELS: usize = 8;
+const ID_ADD_ACCOUNT: usize = 7;
+const ID_REMOVE_BASE: usize = 300; // + index into accounts
+const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
+const DEFAULT_PER_COL: u32 = 2;
 const ID_FONT_BASE: usize = 200; // + index into FONT_SIZES
 const ID_INTERVAL_BASE: usize = 100; // + index into INTERVALS
 
@@ -57,25 +73,52 @@ const FONT_SIZES: [(u32, &str); 6] = [
     (16, "Larger"),
     (18, "Largest"),
 ];
-const DEFAULT_FONT_SIZE: u32 = 14;
+use render::DEFAULT_FONT_SIZE;
 
 const USAGE_URL: &str = "https://claude.ai/settings/usage";
 const RUN_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: *const u16 = w!("ClaudeUsageWidget");
 const SETTINGS_KEY: *const u16 = w!("Software\\ClaudeUsageWidget");
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct RenderKey {
     h: i32,
     dpi: u32,
     dark: bool,
     hover: bool,
-    five: Option<i64>,
-    week: Option<i64>,
-    stale: bool,
+    /// Per account: rounded 5-hour %, weekly %, stale.
+    rows: Vec<(Option<i64>, Option<i64>, bool)>,
     show_left: bool,
     font_size: u32,
     hide_icon: bool,
+    hide_labels: bool,
+    rows_per_col: u32,
+}
+
+/// One Claude Code login, found in its config folder.
+struct Account {
+    /// Stable id; also picks the account's fetch timer.
+    id: u32,
+    dir: PathBuf,
+    /// Email, or the folder name until it's known.
+    label: String,
+    usage: Option<api::Usage>,
+    last_ok: Option<i64>,
+    error: Option<String>,
+    fetching: bool,
+    /// Rate-limit errors in a row; each one doubles the wait.
+    rate_limited: u32,
+}
+
+impl Account {
+    fn new(id: u32, dir: PathBuf) -> Account {
+        let label = api::account_label(&dir);
+        Account { id, dir, label, usage: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
+    }
+
+    fn is_stale(&self) -> bool {
+        self.error.is_some() && self.last_ok.map_or(true, |t| now() - t > 600)
+    }
 }
 
 struct State {
@@ -84,10 +127,8 @@ struct State {
     tip: HWND,
     taskbar: HWND,
     taskbar_created_msg: u32,
-    usage: Option<api::Usage>,
-    last_ok: Option<i64>,
-    error: Option<String>,
-    fetching: bool,
+    accounts: Vec<Account>,
+    next_id: u32,
     hover: bool,
     dark: bool,
     rendered: Option<RenderKey>,
@@ -96,21 +137,32 @@ struct State {
     interval: u32,
     /// Show what's left instead of what's used.
     show_left: bool,
-    /// Rate-limit errors in a row; each one doubles the wait.
-    rate_limited: u32,
     /// Text size in pixels at 100% scaling.
     font_size: u32,
     /// Leave out the Claude mark.
     hide_icon: bool,
+    /// Leave out the `5h` / `W` labels.
+    hide_labels: bool,
+    /// Accounts stacked in each column of the widget.
+    rows_per_col: u32,
+    /// claude-swap's `cswap.exe`, found once at launch.
+    cswap: Option<PathBuf>,
+    /// A `cswap switch` is running.
+    cswap_running: bool,
+    /// A newer release, once a check found one.
+    update: Option<update::Release>,
+    /// What the updater is doing, shown greyed out in the menu.
+    update_busy: Option<&'static str>,
 }
 
 thread_local! {
     static ST: RefCell<State> = RefCell::new(State {
         ctl: null_mut(), widget: null_mut(), tip: null_mut(), taskbar: null_mut(),
-        taskbar_created_msg: 0, usage: None, last_ok: None, error: None,
-        fetching: false, hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
-        interval: DEFAULT_INTERVAL, show_left: false, rate_limited: 0,
-        font_size: DEFAULT_FONT_SIZE, hide_icon: false,
+        taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
+        hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
+        interval: DEFAULT_INTERVAL, show_left: false,
+        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, rows_per_col: DEFAULT_PER_COL,
+        cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
 
@@ -124,11 +176,27 @@ fn now() -> i64 {
 
 fn main() {
     unsafe {
-        // Single instance.
-        CreateMutexW(null(), 0, w!("Local\\ClaudeUsageWidget.Singleton"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            return;
+        // Single instance. Right after an update the previous copy may still
+        // be exiting, so the new one waits for it instead of quitting.
+        let after_update = std::env::args().any(|a| a == update::UPDATED_ARG);
+        let mut tries = 0;
+        loop {
+            let m = CreateMutexW(null(), 0, w!("Local\\ClaudeUsageWidget.Singleton"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                break;
+            }
+            CloseHandle(m);
+            tries += 1;
+            if !after_update || tries > 50 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
+        if let Ok(exe) = std::env::current_exe() {
+            std::thread::spawn(move || update::clean_up_old(&exe));
+        }
+        // The folder picker needs COM on this thread.
+        CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let hinst = GetModuleHandleW(null());
         let cursor = LoadCursorW(null_mut(), IDC_ARROW);
         for (name, proc_) in [
@@ -169,11 +237,22 @@ fn main() {
                 .filter(|v| FONT_SIZES.iter().any(|(f, _)| f == v))
                 .unwrap_or(DEFAULT_FONT_SIZE);
             s.hide_icon = read_setting("HideIcon") == Some(1);
+            s.hide_labels = read_setting("HideLabels") == Some(1);
+            s.cswap = find_cswap();
+            s.rows_per_col = read_setting("AccountsPerColumn")
+                .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
+                .unwrap_or(DEFAULT_PER_COL);
+            for dir in load_account_dirs() {
+                let id = s.next_id;
+                s.next_id += 1;
+                s.accounts.push(Account::new(id, dir));
+            }
         });
         ensure_widget();
         SetTimer(ctl, T_LAYOUT, 1000, None);
         SetTimer(ctl, T_TICK, 30_000, None);
-        start_fetch();
+        SetTimer(ctl, T_UPDATE, UPDATE_FIRST_CHECK_MS, None);
+        start_fetch_all();
 
         let mut m: MSG = std::mem::zeroed();
         while GetMessageW(&mut m, null_mut(), 0, 0) > 0 {
@@ -185,43 +264,63 @@ fn main() {
 
 // ---------- data ----------
 
-fn start_fetch() {
-    let ctl = with(|s| {
-        if s.fetching {
+fn start_fetch(id: u32) {
+    let job = with(|s| {
+        let a = s.accounts.iter_mut().find(|a| a.id == id)?;
+        if a.fetching {
             return None;
         }
-        s.fetching = true;
-        Some(s.ctl as isize)
+        a.fetching = true;
+        Some((s.ctl as isize, a.dir.clone()))
     });
-    let Some(ctl) = ctl else { return };
-    unsafe { KillTimer(ctl as HWND, T_FETCH) };
+    let Some((ctl, dir)) = job else { return };
+    unsafe { KillTimer(ctl as HWND, T_FETCH_BASE + id as usize) };
     std::thread::spawn(move || {
-        let r = Box::new(api::fetch());
-        unsafe { PostMessageW(ctl as HWND, WM_APP_RESULT, 0, Box::into_raw(r) as LPARAM) };
+        let r = api::fetch(&dir);
+        let label = api::account_label(&dir);
+        let msg = Box::new(FetchResult { id, label, r });
+        unsafe { PostMessageW(ctl as HWND, WM_APP_RESULT, 0, Box::into_raw(msg) as LPARAM) };
     });
 }
 
-fn on_result(r: Result<api::Usage, api::FetchError>) {
-    let next_secs = with(|s| {
-        s.fetching = false;
-        let limited = matches!(r, Err(api::FetchError::RateLimited));
-        match r {
+fn start_fetch_all() {
+    for id in with(|s| s.accounts.iter().map(|a| a.id).collect::<Vec<_>>()) {
+        start_fetch(id);
+    }
+}
+
+struct FetchResult {
+    id: u32,
+    label: String,
+    r: Result<api::Usage, api::FetchError>,
+}
+
+fn on_result(res: FetchResult) {
+    let next = with(|s| {
+        let interval = s.interval;
+        // Ignore results for an account removed while it was fetching.
+        let a = s.accounts.iter_mut().find(|a| a.id == res.id)?;
+        a.fetching = false;
+        a.label = res.label;
+        let limited = matches!(res.r, Err(api::FetchError::RateLimited));
+        match res.r {
             Ok(u) => {
-                s.usage = Some(u);
-                s.last_ok = Some(now());
-                s.error = None;
+                a.usage = Some(u);
+                a.last_ok = Some(now());
+                a.error = None;
             }
-            Err(e) => s.error = Some(e.message()),
+            Err(e) => a.error = Some(e.message()),
         }
         if limited {
-            s.rate_limited += 1;
+            a.rate_limited += 1;
         } else {
-            s.rate_limited = 0;
+            a.rate_limited = 0;
         }
-        backoff_secs(s.interval, s.rate_limited)
+        Some((s.ctl, backoff_secs(interval, a.rate_limited)))
     });
-    let ctl = with(|s| s.ctl);
-    unsafe { SetTimer(ctl, T_FETCH, next_secs * 1000, None) };
+    if let Some((ctl, secs)) = next {
+        unsafe { SetTimer(ctl, T_FETCH_BASE + res.id as usize, secs * 1000, None) };
+    }
     ensure_widget();
     update_tooltip();
 }
@@ -233,10 +332,6 @@ fn backoff_secs(interval: u32, rate_limited: u32) -> u32 {
     const MAX_BACKOFF: u32 = 600;
     let grown = interval.saturating_mul(1 << rate_limited.min(10));
     grown.min(MAX_BACKOFF).max(interval)
-}
-
-fn is_stale(s: &State) -> bool {
-    s.error.is_some() && s.last_ok.map_or(true, |t| now() - t > 600)
 }
 
 // ---------- widget ----------
@@ -287,30 +382,45 @@ fn ensure_widget() {
         let scale = dpi as f32 / 96.0;
 
         let (key, needs_render, model) = with(|s| {
-            let u = s.usage.unwrap_or_default();
+            let rows: Vec<render::Row> = s
+                .accounts
+                .iter()
+                .map(|a| {
+                    let u = a.usage.unwrap_or_default();
+                    render::Row {
+                        five: u.five_hour.map(|l| l.percent),
+                        week: u.weekly.map(|l| l.percent),
+                        stale: a.is_stale(),
+                    }
+                })
+                .collect();
             let key = RenderKey {
                 h,
                 dpi,
                 dark: s.dark,
                 hover: s.hover,
-                five: u.five_hour.map(|l| l.percent.round() as i64),
-                week: u.weekly.map(|l| l.percent.round() as i64),
-                stale: is_stale(s),
+                rows: rows
+                    .iter()
+                    .map(|r| (r.five.map(|p| p.round() as i64), r.week.map(|p| p.round() as i64), r.stale))
+                    .collect(),
                 show_left: s.show_left,
                 font_size: s.font_size,
                 hide_icon: s.hide_icon,
+                hide_labels: s.hide_labels,
+                rows_per_col: s.rows_per_col,
             };
             let model = render::Model {
-                five: u.five_hour.map(|l| l.percent),
-                week: u.weekly.map(|l| l.percent),
-                stale: key.stale,
+                rows,
                 hover: s.hover,
                 dark: s.dark,
                 show_left: s.show_left,
                 font_size: s.font_size,
                 hide_icon: s.hide_icon,
+                hide_labels: s.hide_labels,
+                rows_per_col: s.rows_per_col as usize,
             };
-            (key, s.rendered != Some(key), model)
+            let changed = s.rendered.as_ref() != Some(&key);
+            (key, changed, model)
         });
 
         let mut w = with(|s| s.pos.2);
@@ -407,12 +517,14 @@ fn update_tooltip() {
 
 fn tooltip_text(s: &State) -> String {
     let mut out = String::from("Claude usage");
+    let multi = s.accounts.len() > 1;
+    let indent = if multi { "  " } else { "" };
     let line = |name: &str, l: Option<api::Limit>, with_day: bool| -> String {
         match l {
-            None => format!("\n{name}: –"),
+            None => format!("\n{indent}{name}: –"),
             Some(l) => {
                 let used = l.percent.round().clamp(0.0, 100.0) as i64;
-                let mut t = format!("\n{name}: {used}% used, {}% left", 100 - used);
+                let mut t = format!("\n{indent}{name}: {used}% used, {}% left", 100 - used);
                 if let Some(at) = l.resets_at {
                     t += &format!(
                         " · resets in {} ({})",
@@ -424,18 +536,28 @@ fn tooltip_text(s: &State) -> String {
             }
         }
     };
-    let u = s.usage.unwrap_or_default();
-    if s.usage.is_some() {
-        out += &line("5-hour", u.five_hour, false);
-        out += &line("Weekly", u.weekly, true);
-    }
-    if let Some(t) = s.last_ok {
-        out += &format!("\nUpdated {}", local_time(t, false));
-    }
-    if let Some(e) = &s.error {
-        out += &format!("\n⚠ {e}");
-    } else if s.usage.is_none() {
-        out += "\nLoading…";
+    for (i, a) in s.accounts.iter().enumerate() {
+        if multi {
+            // Say where the account sits: columns top to bottom, then left to right.
+            let per = s.rows_per_col as usize;
+            out += &format!("\n\n{}. {}", i + 1, a.label);
+            if s.accounts.len() > per {
+                out += &format!(" (column {}, row {})", i / per + 1, i % per + 1);
+            }
+        }
+        let u = a.usage.unwrap_or_default();
+        if a.usage.is_some() {
+            out += &line("5-hour", u.five_hour, false);
+            out += &line("Weekly", u.weekly, true);
+        }
+        if let Some(t) = a.last_ok {
+            out += &format!("\n{indent}Updated {}", local_time(t, false));
+        }
+        if let Some(e) = &a.error {
+            out += &format!("\n{indent}⚠ {e}");
+        } else if a.usage.is_none() {
+            out += &format!("\n{indent}Loading…");
+        }
     }
     out
 }
@@ -510,17 +632,152 @@ fn write_setting(name: &str, v: u32) {
 }
 
 fn set_interval(secs: u32) {
-    let (ctl, fetching) = with(|s| {
-        s.interval = secs;
-        (s.ctl, s.fetching)
-    });
+    with(|s| s.interval = secs);
     write_setting("IntervalSeconds", secs);
-    // Apply right away: fetch now, then keep the new pace.
-    if !fetching {
-        start_fetch();
-    } else {
-        unsafe { SetTimer(ctl, T_FETCH, secs * 1000, None) };
+    // Apply right away: fetch now, then keep the new pace. Accounts that are
+    // mid-fetch pick up the new pace when they finish.
+    start_fetch_all();
+}
+
+fn read_string_setting(name: &str) -> Option<String> {
+    let name = wide(name);
+    let mut size = 0u32;
+    unsafe {
+        if RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name.as_ptr(), RRF_RT_REG_SZ,
+            null_mut(), null_mut(), &mut size) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let mut buf = vec![0u16; size as usize / 2 + 1];
+        size = (buf.len() * 2) as u32;
+        if RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name.as_ptr(), RRF_RT_REG_SZ,
+            null_mut(), buf.as_mut_ptr() as *mut _, &mut size) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
     }
+}
+
+fn write_string_setting(name: &str, v: &str) {
+    let v = wide(v);
+    unsafe {
+        RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, wide(name).as_ptr(), REG_SZ,
+            v.as_ptr() as *const _, (v.len() * 2) as u32);
+    }
+}
+
+// ---------- accounts ----------
+
+/// Saved account folders, separated by `|` (which paths can't contain).
+/// With nothing saved, the one account Claude Code uses by default.
+fn load_account_dirs() -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = read_string_setting("Accounts")
+        .unwrap_or_default()
+        .split('|')
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if dirs.is_empty() {
+        vec![api::default_dir()]
+    } else {
+        dirs
+    }
+}
+
+fn save_accounts() {
+    let joined = with(|s| {
+        s.accounts.iter().map(|a| a.dir.display().to_string()).collect::<Vec<_>>().join("|")
+    });
+    write_string_setting("Accounts", &joined);
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
+}
+
+unsafe fn message(text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let ctl = with(|s| s.ctl);
+    MessageBoxW(ctl, wide(text).as_ptr(), w!("Claude Usage Widget"), flags | MB_SETFOREGROUND)
+}
+
+/// Asks for a folder with the standard Windows folder picker.
+unsafe fn pick_folder() -> Option<PathBuf> {
+    let ctl = with(|s| s.ctl);
+    let title = wide(
+        "Select the account's Claude Code folder (the one CLAUDE_CONFIG_DIR points to, \
+         e.g. .claude-work), or the user folder that contains .claude.",
+    );
+    let bi = BROWSEINFOW {
+        hwndOwner: ctl,
+        lpszTitle: title.as_ptr(),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..std::mem::zeroed()
+    };
+    let pidl = SHBrowseForFolderW(&bi);
+    if pidl.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let ok = SHGetPathFromIDListW(pidl, buf.as_mut_ptr()) != 0;
+    CoTaskMemFree(pidl as *const _);
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+unsafe fn add_account() {
+    let Some(picked) = pick_folder() else { return };
+    // Accept the config folder itself, or a home folder holding `.claude`.
+    let dir = if api::has_login(&picked) {
+        picked
+    } else if api::has_login(&picked.join(".claude")) {
+        picked.join(".claude")
+    } else {
+        let text = format!(
+            "No Claude Code login found in\n{}\n\nAdd it anyway? It will show up once you sign in \
+             to Claude Code with this folder.",
+            picked.display()
+        );
+        if message(&text, MB_YESNO | MB_ICONWARNING) != IDYES {
+            return;
+        }
+        picked
+    };
+    if with(|s| s.accounts.iter().any(|a| same_dir(&a.dir, &dir))) {
+        message("This account is already in the widget.", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    let id = with(|s| {
+        let id = s.next_id;
+        s.next_id += 1;
+        s.accounts.push(Account::new(id, dir));
+        id
+    });
+    save_accounts();
+    ensure_widget();
+    update_tooltip();
+    start_fetch(id);
+}
+
+unsafe fn remove_account(index: usize) {
+    let Some(label) = with(|s| s.accounts.get(index).map(|a| a.label.clone())) else { return };
+    let text = format!("Remove {label} from the widget?\n\nThis doesn't sign it out of Claude Code.");
+    if message(&text, MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return;
+    }
+    let (ctl, id) = with(|s| {
+        let a = s.accounts.remove(index);
+        (s.ctl, a.id)
+    });
+    KillTimer(ctl, T_FETCH_BASE + id as usize);
+    save_accounts();
+    ensure_widget();
+    update_tooltip();
 }
 
 fn autostart_enabled() -> bool {
@@ -544,18 +801,248 @@ fn set_autostart(on: bool) {
     }
 }
 
+// ---------- claude-swap ----------
+
+/// Finds claude-swap's `cswap.exe`: on PATH, or in `~\.localin`, where
+/// `uv tool install` and `pipx` put it.
+fn find_cswap() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        dirs.push(PathBuf::from(home).join(".local").join("bin"));
+    }
+    dirs.into_iter().map(|d| d.join("cswap.exe")).find(|p| p.is_file())
+}
+
+/// Runs `cswap switch` (rotate to the next account) in the background, then
+/// refreshes the widget. JSON mode never stops to ask a question.
+fn run_cswap_switch(exe: PathBuf) {
+    let ctl = with(|s| {
+        if s.cswap_running {
+            return None;
+        }
+        s.cswap_running = true;
+        Some(s.ctl as isize)
+    });
+    let Some(ctl) = ctl else { return };
+    std::thread::spawn(move || {
+        let r = Box::new(cswap_switch(&exe));
+        unsafe { PostMessageW(ctl as HWND, WM_APP_CSWAP, 0, Box::into_raw(r) as LPARAM) };
+    });
+}
+
+fn cswap_switch(exe: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const TIMEOUT_SECS: u64 = 60;
+
+    let mut child = Command::new(exe)
+        .args(["switch", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("Could not start cswap: {e}"))?;
+    // Read the pipes on their own threads so a chatty cswap can't block on a full pipe.
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as _));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed().as_secs() < TIMEOUT_SECS => {
+                std::thread::sleep(std::time::Duration::from_millis(200))
+            }
+            _ => {
+                let _ = child.kill();
+                return Err(format!("cswap didn't finish within {TIMEOUT_SECS} seconds."));
+            }
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
+    if let Some(v) = &json {
+        if let Some(m) = v["error"]["message"].as_str() {
+            return Err(m.to_string());
+        }
+        if v["switched"] == serde_json::Value::Bool(false) {
+            let reason = v["reason"].as_str().unwrap_or("cswap didn't switch accounts.");
+            return Err(reason.to_string());
+        }
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = [stderr.trim(), stdout.trim()].into_iter().find(|t| !t.is_empty());
+        Err(detail.unwrap_or("cswap failed.").chars().take(500).collect())
+    }
+}
+
+// ---------- updates ----------
+
+/// First check shortly after launch, then once a day.
+const UPDATE_FIRST_CHECK_MS: u32 = 15_000;
+const UPDATE_EVERY_MS: u32 = 24 * 60 * 60 * 1000;
+
+enum UpdateMsg {
+    Checked { manual: bool, r: Result<Option<update::Release>, String> },
+    Installed { rel: update::Release, r: Result<(), update::InstallError> },
+}
+
+fn post_update(ctl: isize, msg: UpdateMsg) {
+    unsafe { PostMessageW(ctl as HWND, WM_APP_UPDATE, 0, Box::into_raw(Box::new(msg)) as LPARAM) };
+}
+
+/// Looks for a newer release. `manual` (from the menu) also reports
+/// "up to date" and errors; the daily check stays quiet.
+fn start_update_check(manual: bool) {
+    let ctl = with(|s| {
+        if s.update_busy.is_some() {
+            return None;
+        }
+        s.update_busy = Some("Checking for updates…");
+        Some(s.ctl as isize)
+    });
+    let Some(ctl) = ctl else { return };
+    std::thread::spawn(move || post_update(ctl, UpdateMsg::Checked { manual, r: update::check() }));
+}
+
+fn start_update_install() {
+    let job = with(|s| {
+        if s.update_busy.is_some() {
+            return None;
+        }
+        let rel = s.update.clone()?;
+        s.update_busy = Some("Updating…");
+        Some((s.ctl as isize, rel))
+    });
+    let Some((ctl, rel)) = job else { return };
+    std::thread::spawn(move || {
+        let r = match std::env::current_exe() {
+            Ok(exe) => update::install(&rel, &exe),
+            Err(e) => Err(update::InstallError::Other(format!("Can't find the widget's exe: {e}"))),
+        };
+        post_update(ctl, UpdateMsg::Installed { rel, r });
+    });
+}
+
+unsafe fn on_update_msg(msg: UpdateMsg) {
+    let ctl = with(|s| {
+        s.update_busy = None;
+        s.ctl
+    });
+    match msg {
+        UpdateMsg::Checked { manual, r } => {
+            SetTimer(ctl, T_UPDATE, UPDATE_EVERY_MS, None);
+            let current = concat!("v", env!("CARGO_PKG_VERSION"));
+            match r {
+                Ok(Some(rel)) => {
+                    let tag = rel.tag.clone();
+                    with(|s| s.update = Some(rel));
+                    if manual {
+                        let text = format!(
+                            "Version {tag} is available (you have {current}).\n\nUpdate now? The widget restarts by itself."
+                        );
+                        if message(&text, MB_YESNO | MB_ICONINFORMATION) == IDYES {
+                            start_update_install();
+                        }
+                    }
+                }
+                Ok(None) => {
+                    with(|s| s.update = None);
+                    if manual {
+                        message(&format!("You have the latest version ({current})."), MB_OK | MB_ICONINFORMATION);
+                    }
+                }
+                Err(e) => {
+                    if manual {
+                        message(&format!("Couldn't check for updates:\n\n{e}"), MB_OK | MB_ICONWARNING);
+                    }
+                }
+            }
+        }
+        UpdateMsg::Installed { rel, r } => match r {
+            Ok(()) => {
+                let exe = std::env::current_exe().unwrap_or_default();
+                if let Err(e) = std::process::Command::new(&exe).arg(update::UPDATED_ARG).spawn() {
+                    message(
+                        &format!("{} was installed but couldn't be started:\n\n{e}\n\nStart the widget again by hand.", rel.tag),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+                quit();
+            }
+            Err(update::InstallError::NoAccess) => {
+                let folder = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                    .unwrap_or_default();
+                message(
+                    &format!(
+                        "The widget can't update itself in\n{folder}\nbecause that folder needs administrator rights.\n\n\
+                         The download page will open so you can replace the exe by hand. Keeping the widget in a folder \
+                         of your own, like %LOCALAPPDATA%\\Programs\\ClaudeUsageWidget, lets it update itself."
+                    ),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                open_url(&rel.page);
+            }
+            Err(update::InstallError::Other(e)) => {
+                message(&format!("Updating to {} failed:\n\n{e}", rel.tag), MB_OK | MB_ICONWARNING);
+            }
+        },
+    }
+}
+
+unsafe fn quit() {
+    let (widget, ctl) = with(|s| (s.widget, s.ctl));
+    if !widget.is_null() {
+        DestroyWindow(widget);
+    }
+    DestroyWindow(ctl);
+}
+
+fn on_cswap_done(r: Result<(), String>) {
+    with(|s| s.cswap_running = false);
+    match r {
+        // The live login changed: show the new account's numbers now.
+        Ok(()) => start_fetch_all(),
+        Err(e) => unsafe {
+            message(&format!("Switching accounts with claude-swap failed:
+
+{e}"), MB_OK | MB_ICONWARNING);
+        },
+    }
+}
+
 fn open_usage_page() {
+    open_url(USAGE_URL);
+}
+
+fn open_url(url: &str) {
     unsafe {
-        ShellExecuteW(null_mut(), w!("open"), wide(USAGE_URL).as_ptr(), null(), null(), SW_SHOWNORMAL);
+        ShellExecuteW(null_mut(), w!("open"), wide(url).as_ptr(), null(), null(), SW_SHOWNORMAL);
     }
 }
 
 unsafe fn show_menu() {
     let ctl = with(|s| s.ctl);
     let menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
-    AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    // Settings first, then the everyday actions next to Exit, closest to the
+    // taskbar where the menu opens.
     let (interval, show_left) = with(|s| (s.interval, s.show_left));
     let sub = CreatePopupMenu();
     for (i, (secs, label)) in INTERVALS.iter().enumerate() {
@@ -565,7 +1052,7 @@ unsafe fn show_menu() {
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
     let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
     AppendMenuW(menu, check(show_left), ID_SHOW_LEFT, w!("Show remaining instead of used"));
-    let (font_size, hide_icon) = with(|s| (s.font_size, s.hide_icon));
+    let (font_size, hide_icon, hide_labels) = with(|s| (s.font_size, s.hide_icon, s.hide_labels));
     let custom = CreatePopupMenu();
     let fonts = CreatePopupMenu();
     for (i, (px, label)) in FONT_SIZES.iter().enumerate() {
@@ -573,8 +1060,52 @@ unsafe fn show_menu() {
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
     AppendMenuW(custom, check(hide_icon), ID_HIDE_ICON, w!("Hide Claude icon"));
+    AppendMenuW(custom, check(hide_labels), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
+    // Only matters with more than one account.
+    let (per_col, n_accounts) = with(|s| (s.rows_per_col, s.accounts.len()));
+    let per = CreatePopupMenu();
+    for n in 1..=render::MAX_ROWS_PER_COLUMN as u32 {
+        let text = wide(&n.to_string());
+        AppendMenuW(per, check(n == per_col), ID_PER_COL_BASE + n as usize, text.as_ptr());
+    }
+    let per_flags = if n_accounts > 1 { MF_POPUP } else { MF_POPUP | MF_GRAYED };
+    AppendMenuW(custom, per_flags, per as usize, w!("Accounts per column"));
     AppendMenuW(menu, MF_POPUP, custom as usize, w!("Customize"));
+    let accounts = CreatePopupMenu();
+    AppendMenuW(accounts, MF_STRING, ID_ADD_ACCOUNT, w!("Add account…"));
+    let labels = with(|s| s.accounts.iter().map(|a| a.label.clone()).collect::<Vec<_>>());
+    if !labels.is_empty() {
+        AppendMenuW(accounts, MF_SEPARATOR, 0, null());
+    }
+    // Keep at least one account.
+    let removable = if labels.len() > 1 { MF_STRING } else { MF_STRING | MF_GRAYED };
+    for (i, label) in labels.iter().enumerate() {
+        let text = wide(&format!("Remove {}", label.replace('&', "&&")));
+        AppendMenuW(accounts, removable, ID_REMOVE_BASE + i, text.as_ptr());
+    }
+    AppendMenuW(menu, MF_POPUP, accounts as usize, w!("Accounts"));
     AppendMenuW(menu, check(autostart_enabled()), ID_AUTOSTART, w!("Start with Windows"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, null());
+    AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
+    AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
+    // Only when claude-swap was installed at launch.
+    let (cswap, running) = with(|s| (s.cswap.clone(), s.cswap_running));
+    if cswap.is_some() {
+        let (flags, text) = if running {
+            (MF_STRING | MF_GRAYED, w!("Switching account…"))
+        } else {
+            (MF_STRING, w!("Switch to next account (cswap)"))
+        };
+        AppendMenuW(menu, flags, ID_CSWAP, text);
+    }
+    let (busy, new_tag) = with(|s| (s.update_busy, s.update.as_ref().map(|r| r.tag.clone())));
+    let update_text = match (busy, &new_tag) {
+        (Some(b), _) => b.to_string(),
+        (None, Some(tag)) => format!("Update to {tag}"),
+        (None, None) => "Check for updates".to_string(),
+    };
+    let update_flags = if busy.is_some() { MF_STRING | MF_GRAYED } else { MF_STRING };
+    AppendMenuW(menu, update_flags, ID_UPDATE, wide(&update_text).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
     let mut pt = POINT { x: 0, y: 0 };
@@ -585,8 +1116,17 @@ unsafe fn show_menu() {
     PostMessageW(ctl, WM_NULL, 0, 0);
     DestroyMenu(menu);
     match cmd as usize {
-        ID_REFRESH => start_fetch(),
+        ID_REFRESH => start_fetch_all(),
+        ID_ADD_ACCOUNT => add_account(),
+        id if (ID_REMOVE_BASE..ID_REMOVE_BASE + labels.len()).contains(&id) => {
+            remove_account(id - ID_REMOVE_BASE);
+        }
         ID_OPEN => open_usage_page(),
+        ID_CSWAP => {
+            if let Some(exe) = cswap {
+                run_cswap_switch(exe);
+            }
+        }
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
         ID_SHOW_LEFT => {
             let on = with(|s| {
@@ -594,6 +1134,14 @@ unsafe fn show_menu() {
                 s.show_left
             });
             write_setting("ShowRemaining", on as u32);
+            ensure_widget();
+        }
+        ID_HIDE_LABELS => {
+            let on = with(|s| {
+                s.hide_labels = !s.hide_labels;
+                s.hide_labels
+            });
+            write_setting("HideLabels", on as u32);
             ensure_widget();
         }
         ID_HIDE_ICON => {
@@ -604,6 +1152,13 @@ unsafe fn show_menu() {
             write_setting("HideIcon", on as u32);
             ensure_widget();
         }
+        id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+            let n = (id - ID_PER_COL_BASE) as u32;
+            with(|s| s.rows_per_col = n);
+            write_setting("AccountsPerColumn", n);
+            ensure_widget();
+            update_tooltip();
+        }
         id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
             let px = FONT_SIZES[id - ID_FONT_BASE].0;
             with(|s| s.font_size = px);
@@ -613,13 +1168,14 @@ unsafe fn show_menu() {
         id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
             set_interval(INTERVALS[id - ID_INTERVAL_BASE].0);
         }
-        ID_EXIT => {
-            let widget = with(|s| s.widget);
-            if !widget.is_null() {
-                DestroyWindow(widget);
+        ID_UPDATE => {
+            if new_tag.is_some() {
+                start_update_install();
+            } else {
+                start_update_check(true);
             }
-            DestroyWindow(ctl);
         }
+        ID_EXIT => quit(),
         _ => {}
     }
 }
@@ -632,31 +1188,52 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_TIMER => {
             match wp {
                 T_LAYOUT => ensure_widget(),
-                T_FETCH => start_fetch(),
+                T_UPDATE => {
+                    KillTimer(hwnd, T_UPDATE);
+                    start_update_check(false);
+                }
                 T_TICK => {
                     update_tooltip();
                     // A window just reset: fetch now instead of waiting.
                     // Not while the last fetch failed: that would retry every
                     // 30 seconds and skip the backoff set in on_result.
-                    let reset_passed = with(|s| {
-                        if s.error.is_some() {
-                            return false;
-                        }
-                        let u = s.usage.unwrap_or_default();
-                        [u.five_hour, u.weekly].iter().flatten().any(|l| {
-                            l.resets_at.is_some_and(|t| t < now() && s.last_ok.is_some_and(|ok| ok < t))
-                        })
+                    let reset_passed: Vec<u32> = with(|s| {
+                        s.accounts
+                            .iter()
+                            .filter(|a| {
+                                if a.error.is_some() {
+                                    return false;
+                                }
+                                let u = a.usage.unwrap_or_default();
+                                [u.five_hour, u.weekly].iter().flatten().any(|l| {
+                                    l.resets_at
+                                        .is_some_and(|t| t < now() && a.last_ok.is_some_and(|ok| ok < t))
+                                })
+                            })
+                            .map(|a| a.id)
+                            .collect()
                     });
-                    if reset_passed {
-                        start_fetch();
+                    for id in reset_passed {
+                        start_fetch(id);
                     }
                 }
+                id if id >= T_FETCH_BASE => start_fetch((id - T_FETCH_BASE) as u32),
                 _ => {}
             }
             0
         }
+        WM_APP_UPDATE => {
+            let m = Box::from_raw(lp as *mut UpdateMsg);
+            on_update_msg(*m);
+            0
+        }
+        WM_APP_CSWAP => {
+            let r = Box::from_raw(lp as *mut Result<(), String>);
+            on_cswap_done(*r);
+            0
+        }
         WM_APP_RESULT => {
-            let r = Box::from_raw(lp as *mut Result<api::Usage, api::FetchError>);
+            let r = Box::from_raw(lp as *mut FetchResult);
             on_result(*r);
             0
         }
@@ -667,7 +1244,9 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_POWERBROADCAST => {
             if wp as u32 == PBT_APMRESUMEAUTOMATIC {
-                SetTimer(hwnd, T_FETCH, 5000, None);
+                for id in with(|s| s.accounts.iter().map(|a| a.id).collect::<Vec<_>>()) {
+                    SetTimer(hwnd, T_FETCH_BASE + id as usize, 5000, None);
+                }
             }
             1
         }
