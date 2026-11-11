@@ -48,6 +48,8 @@ One small file (~300 KB). No installer, no runtime, nothing else to download.
 | Right-click → **Refresh now** | Updates immediately |
 | Right-click → **Update every** | 30 s, 1, 2, 5, 10, 15 or 30 minutes (default: 2 minutes) |
 | Right-click → **Show remaining instead of used** | Shows `75%` left instead of `25%` used |
+| Right-click → **Customize → Font size** | Six text sizes, from Smallest to Largest |
+| Right-click → **Customize → Hide Claude icon** | Shows only the numbers, without the Claude mark |
 | Right-click → **Start with Windows** | Starts the widget when you sign in to Windows |
 | Right-click → **Exit** | Closes the widget |
 

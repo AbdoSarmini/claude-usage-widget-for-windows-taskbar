@@ -32,6 +32,8 @@ const ID_OPEN: usize = 2;
 const ID_AUTOSTART: usize = 3;
 const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
+const ID_HIDE_ICON: usize = 6;
+const ID_FONT_BASE: usize = 200; // + index into FONT_SIZES
 const ID_INTERVAL_BASE: usize = 100; // + index into INTERVALS
 
 /// Update interval choices (seconds, menu label).
@@ -45,6 +47,17 @@ const INTERVALS: [(u32, &str); 7] = [
     (1800, "30 minutes"),
 ];
 const DEFAULT_INTERVAL: u32 = 120;
+
+/// Font size choices (pixels at 100% scaling, menu label).
+const FONT_SIZES: [(u32, &str); 6] = [
+    (12, "Smallest"),
+    (13, "Small"),
+    (14, "Default"),
+    (15, "Large"),
+    (16, "Larger"),
+    (18, "Largest"),
+];
+const DEFAULT_FONT_SIZE: u32 = 14;
 
 const USAGE_URL: &str = "https://claude.ai/settings/usage";
 const RUN_KEY: *const u16 = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -61,6 +74,8 @@ struct RenderKey {
     week: Option<i64>,
     stale: bool,
     show_left: bool,
+    font_size: u32,
+    hide_icon: bool,
 }
 
 struct State {
@@ -83,6 +98,10 @@ struct State {
     show_left: bool,
     /// Rate-limit errors in a row; each one doubles the wait.
     rate_limited: u32,
+    /// Text size in pixels at 100% scaling.
+    font_size: u32,
+    /// Leave out the Claude mark.
+    hide_icon: bool,
 }
 
 thread_local! {
@@ -91,6 +110,7 @@ thread_local! {
         taskbar_created_msg: 0, usage: None, last_ok: None, error: None,
         fetching: false, hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false, rate_limited: 0,
+        font_size: DEFAULT_FONT_SIZE, hide_icon: false,
     });
 }
 
@@ -145,6 +165,10 @@ fn main() {
                 .filter(|v| (30..=1800).contains(v))
                 .unwrap_or(DEFAULT_INTERVAL);
             s.show_left = read_setting("ShowRemaining") == Some(1);
+            s.font_size = read_setting("FontSize")
+                .filter(|v| FONT_SIZES.iter().any(|(f, _)| f == v))
+                .unwrap_or(DEFAULT_FONT_SIZE);
+            s.hide_icon = read_setting("HideIcon") == Some(1);
         });
         ensure_widget();
         SetTimer(ctl, T_LAYOUT, 1000, None);
@@ -273,6 +297,8 @@ fn ensure_widget() {
                 week: u.weekly.map(|l| l.percent.round() as i64),
                 stale: is_stale(s),
                 show_left: s.show_left,
+                font_size: s.font_size,
+                hide_icon: s.hide_icon,
             };
             let model = render::Model {
                 five: u.five_hour.map(|l| l.percent),
@@ -281,6 +307,8 @@ fn ensure_widget() {
                 hover: s.hover,
                 dark: s.dark,
                 show_left: s.show_left,
+                font_size: s.font_size,
+                hide_icon: s.hide_icon,
             };
             (key, s.rendered != Some(key), model)
         });
@@ -537,6 +565,15 @@ unsafe fn show_menu() {
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
     let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
     AppendMenuW(menu, check(show_left), ID_SHOW_LEFT, w!("Show remaining instead of used"));
+    let (font_size, hide_icon) = with(|s| (s.font_size, s.hide_icon));
+    let custom = CreatePopupMenu();
+    let fonts = CreatePopupMenu();
+    for (i, (px, label)) in FONT_SIZES.iter().enumerate() {
+        AppendMenuW(fonts, check(*px == font_size), ID_FONT_BASE + i, wide(label).as_ptr());
+    }
+    AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
+    AppendMenuW(custom, check(hide_icon), ID_HIDE_ICON, w!("Hide Claude icon"));
+    AppendMenuW(menu, MF_POPUP, custom as usize, w!("Customize"));
     AppendMenuW(menu, check(autostart_enabled()), ID_AUTOSTART, w!("Start with Windows"));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -557,6 +594,20 @@ unsafe fn show_menu() {
                 s.show_left
             });
             write_setting("ShowRemaining", on as u32);
+            ensure_widget();
+        }
+        ID_HIDE_ICON => {
+            let on = with(|s| {
+                s.hide_icon = !s.hide_icon;
+                s.hide_icon
+            });
+            write_setting("HideIcon", on as u32);
+            ensure_widget();
+        }
+        id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
+            let px = FONT_SIZES[id - ID_FONT_BASE].0;
+            with(|s| s.font_size = px);
+            write_setting("FontSize", px);
             ensure_widget();
         }
         id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {

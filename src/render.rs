@@ -60,6 +60,10 @@ pub struct Model {
     pub dark: bool,
     /// Show what's left (100 - used) instead of what's used.
     pub show_left: bool,
+    /// Text size in pixels at 100% scaling.
+    pub font_size: u32,
+    /// Leave out the Claude mark.
+    pub hide_icon: bool,
 }
 
 pub struct Frame {
@@ -127,7 +131,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let pal = palette(m.dark);
     let s = |v: f32| (v * scale).round() as i32;
     unsafe {
-        let font_px = s(14.0);
+        let font_px = s(m.font_size as f32);
         let f_label = make_font(font_px, &["Segoe UI Variable Text", "Segoe UI"]);
         let f_value = make_font(font_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);
 
@@ -141,8 +145,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
 
         let dim = |c: Rgba| if m.stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
         let pad_l = s(8.0);
-        let icon = s(18.0);
-        let gap_icon = s(7.0);
+        let icon = if m.hide_icon { 0 } else { s(18.0) };
+        let gap_icon = if m.hide_icon { 0 } else { s(7.0) };
         let gap_lv = s(5.0);
         let gap_div = s(10.0);
         let div_w = s(1.0).max(1);
