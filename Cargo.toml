@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-widget"
-version = "1.0.0"
+version = "1.0.1"
 description = "Claude 5-hour and weekly usage in the Windows 11 taskbar"
 license = "MIT"
 repository = "https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar"
