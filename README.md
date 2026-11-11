@@ -14,7 +14,7 @@ One small file (~450 KB). No installer, no runtime, nothing else to download.
 ## Features
 
 - **Always visible.** Shows `5h` and `W` (weekly) usage right in the taskbar, not hidden behind a tray icon.
-- **Tiny.** About 2–3 MB of memory and practically zero CPU. It's built only on Windows' own APIs.
+- **Tiny.** About 5 MB of memory and practically zero CPU. It's built only on Windows' own APIs.
 - **Colour warnings.** A number turns orange at 80% used and red at 95%.
 - **Details on hover.** The tooltip shows used and left percentages, when each limit resets, and when the numbers were last updated.
 - **Light and dark taskbars.** It follows your Windows theme automatically.
