@@ -50,12 +50,17 @@ pub fn palette(dark: bool) -> Palette {
     }
 }
 
+const RING_BLUE: Rgba = Rgba(0.298, 0.608, 0.961, 1.0); // #4C9BF5
 pub const CLAUDE_ORANGE: Rgba = Rgba(0.851, 0.467, 0.341, 1.0); // #D97757
 
 /// One account's numbers.
 pub struct Row {
     pub five: Option<f64>,
     pub week: Option<f64>,
+    /// Fable's weekly limit; its group only shows when some account has one.
+    pub fable: Option<f64>,
+    /// A change being animated: the values before it (5h, week, Fable) and progress 0 to 1.
+    pub roll: Option<([Option<f64>; 3], f32)>,
     pub stale: bool,
 }
 
@@ -75,8 +80,20 @@ pub struct Model {
     pub font_size: u32,
     /// Leave out the Claude mark.
     pub hide_icon: bool,
+    /// Draw the pixel-art mark instead of the asterisk.
+    pub pixel_icon: bool,
+    /// Icon size in pixels at 100% scaling.
+    pub icon_size: u32,
+    /// Draw a progress ring for each limit.
+    pub rings: bool,
+    /// With rings: put the number inside a larger ring instead of beside a small one.
+    pub ring_text: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
+    /// Leave out the 5-hour, weekly or Fable group.
+    pub hide_five: bool,
+    pub hide_week: bool,
+    pub hide_fable: bool,
     /// Accounts stacked per column (1 to MAX_ROWS_PER_COLUMN); more start a new column.
     pub rows_per_col: usize,
 }
@@ -136,11 +153,25 @@ unsafe fn font_is(f: HFONT, face: &str) -> bool {
 struct Seg {
     text: Vec<u16>,
     bold: bool,
+    /// The small font that fits inside a ring.
+    small: bool,
     x: i32,
     w: i32,
     /// Vertical band of the account row this text belongs to.
     y0: i32,
     y1: i32,
+    color: Rgba,
+    /// Vertical motion blur radius in pixels.
+    blur: i32,
+    /// Room past `w` for glyph overhang.
+    slack: i32,
+}
+
+struct Ring {
+    x: i32,
+    y: i32,
+    /// Filled part, 0 to 1, clockwise from the top.
+    frac: f32,
     color: Rgba,
 }
 
@@ -154,7 +185,7 @@ struct Divider {
 pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
     let pal = palette(m.dark);
     let s = |v: f32| (v * scale).round() as i32;
-    let empty = [Row { five: None, week: None, stale: false }];
+    let empty = [Row { five: None, week: None, fable: None, roll: None, stale: false }];
     let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
     let rows_per_col = m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN);
     let per_col = rows.len().min(rows_per_col);
@@ -180,6 +211,15 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             let fit = row_h * 0.8 * m.font_size as f32 / DEFAULT_FONT_SIZE as f32;
             font_px = font_px.min(fit.min(row_h).round() as i32).max(1);
         }
+        let inside = m.rings && m.ring_text;
+        // Ring diameter: big enough for the number inside, or about text height beside it.
+        let ring_d = if !m.rings { 0 } else { (row_h as i32 - s(2.0)).clamp(1, s(if inside { 34.0 } else { 16.0 })) };
+        let ring_gap = if m.rings && !inside { s(5.0) } else { 0 };
+        let small_px = ((ring_d as f32 * 0.28).round() as i32).max(1);
+        let f_small = make_font(
+            small_px,
+            &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"],
+        );
         let f_label = make_font(font_px, &["Segoe UI Variable Text", "Segoe UI"]);
         let f_value = make_font(font_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);
 
@@ -194,7 +234,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         let dim = |stale: bool, c: Rgba| if stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
         let all_stale = rows.iter().all(|r| r.stale);
         let pad_l = s(8.0);
-        let icon = if m.hide_icon { 0 } else { s(18.0) };
+        let icon = if m.hide_icon { 0 } else { s(m.icon_size as f32).min(h) };
         let gap_icon = if m.hide_icon { 0 } else { s(7.0) };
         let gap_lv = if m.hide_labels { 0 } else { s(5.0) };
         let gap_div = s(10.0);
@@ -207,56 +247,125 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         x += icon + gap_icon;
         let mut segs = Vec::new();
         let mut dividers = Vec::new();
+        let mut rings = Vec::new();
         let enc = |t: &str| -> Vec<u16> { t.encode_utf16().collect() };
         let columns: Vec<&[Row]> = rows.chunks(rows_per_col).collect();
         for (ci, col) in columns.iter().enumerate() {
             // Line the column's rows up: each field is as wide as its widest value.
-            let labels = [enc("5h"), enc("W")];
-            let label_w = if m.hide_labels {
-                [0, 0]
-            } else {
-                [measure(&labels[0], f_label), measure(&labels[1], f_label)]
-            };
-            let values: Vec<[Vec<u16>; 2]> = col
+            let labels = [enc("5h"), enc("W"), enc("F")];
+            // Which of 5h / week / Fable are shown, as indexes into `labels`.
+            let ids: Vec<usize> = [!m.hide_five, !m.hide_week, !m.hide_fable && rows.iter().any(|r| r.fable.is_some())]
                 .iter()
-                .map(|r| [enc(&value_text(r.five, m.show_left)), enc(&value_text(r.week, m.show_left))])
+                .enumerate()
+                .filter_map(|(k, on)| on.then_some(k))
                 .collect();
-            let mut value_w = [0; 2];
+            let groups = ids.len();
+            let label_w: Vec<i32> = ids
+                .iter()
+                .map(|&k| &labels[k])
+                .map(|l| if m.hide_labels { 0 } else { measure(l, f_label) })
+                .collect();
+            let values: Vec<Vec<Vec<u16>>> = col
+                .iter()
+                .map(|r| ids.iter().map(|&k| enc(&value_text([r.five, r.week, r.fable][k], m.show_left))).collect())
+                .collect();
+            let mut value_w = vec![0; groups];
             for v in &values {
-                for g in 0..2 {
-                    value_w[g] = value_w[g].max(measure(&v[g], f_value));
+                for g in 0..groups {
+                    value_w[g] = value_w[g].max(measure(&v[g], if inside { f_small } else { f_value }));
                 }
             }
-            let mut group_x = [0; 2];
-            let mut div_x = [0; 2];
-            for g in 0..2 {
+            let mut group_x = vec![0; groups];
+            let mut div_x = vec![0; groups];
+            for g in 0..groups {
                 group_x[g] = x;
-                x += label_w[g] + gap_lv + value_w[g] + gap_div;
+                x += label_w[g] + gap_lv + if inside { ring_d } else { ring_d + ring_gap + value_w[g] } + gap_div;
                 div_x[g] = x;
                 x += div_w;
-                if g == 0 {
+                if g + 1 < groups {
                     x += gap_div;
                 }
             }
             for (ri, (row, vals)) in col.iter().zip(&values).enumerate() {
                 let (y0, y1) = row_band(ri);
-                for g in 0..2 {
-                    let val = if g == 0 { row.five } else { row.week };
-                    if !m.hide_labels {
-                        segs.push(Seg { text: labels[g].clone(), bold: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label });
+                // Eased progress of a rolling change (ease in-out cubic) and its speed, for the blur.
+                let (p, speed) = match row.roll {
+                    Some((_, t)) if t < 0.5 => (4.0 * t * t * t, 12.0 * t * t),
+                    Some((_, t)) => {
+                        let u = 2.0 - 2.0 * t.min(1.0);
+                        (1.0 - u * u * u / 2.0, 3.0 * u * u)
                     }
-                    let vw = measure(&vals[g], f_value);
-                    segs.push(Seg {
-                        text: vals[g].clone(),
-                        bold: true,
-                        x: group_x[g] + label_w[g] + gap_lv,
-                        w: vw,
-                        y0,
-                        y1,
-                        color: dim(row.stale, value_color(val, &pal)),
-                    });
+                    None => (1.0, 0.0),
+                };
+                for g in 0..groups {
+                    let val = [row.five, row.week, row.fable][ids[g]];
+                    if !m.hide_labels {
+                        segs.push(Seg { text: labels[ids[g]].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
+                    }
                     let dy = y0 + ((y1 - y0) - div_h) / 2;
                     dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
+                    let content_x = group_x[g] + label_w[g] + gap_lv;
+                    let color = value_color(val, &pal);
+                    if m.rings {
+                        // The ring shows the same quantity as the number.
+                        let frac = |v: Option<f64>| {
+                            let used = v.map_or(0.0, |q| q.round().clamp(0.0, 100.0) as f32 / 100.0);
+                            if v.is_some() && m.show_left { 1.0 - used } else { used }
+                        };
+                        let to = frac(val);
+                        rings.push(Ring {
+                            x: content_x,
+                            y: y0 + ((y1 - y0) - ring_d) / 2,
+                            frac: row.roll.map_or(to, |(from, _)| frac(from[ids[g]]) + (to - frac(from[ids[g]])) * p),
+                            color: dim(row.stale, if color == pal.value { RING_BLUE } else { color }),
+                        });
+                    }
+                    let vf = if inside { f_small } else { f_value };
+                    let text_x = |tw: i32| if inside { content_x + (ring_d - tw) / 2 } else { content_x + ring_d + ring_gap };
+                    let color = dim(row.stale, color);
+                    let old = row
+                        .roll
+                        .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left)))
+                        .filter(|o| *o != vals[g]);
+                    let Some(old) = old else {
+                        let vw = measure(&vals[g], vf);
+                        segs.push(Seg { text: vals[g].clone(), bold: true, small: inside, x: text_x(vw), w: vw, y0, y1, color, blur: 0, slack: s(2.0) });
+                        continue;
+                    };
+                    // Rolling: each changed character's old glyph leaves upward while the new
+                    // one arrives from below, one line apart, each drawn in its own line box.
+                    let mut line = ((if inside { small_px } else { font_px }) as f32 * 1.25).round() as i32;
+                    line += (line - (y1 - y0)) & 1; // same parity as the row, so still glyphs don't shift
+                    let top = y0 + ((y1 - y0) - line) / 2;
+                    let moved = (p * line as f32).round() as i32;
+                    let blur = (speed * line as f32 * 0.048).round() as i32;
+                    for (text, other, is_new) in [(&old, &vals[g], false), (&vals[g], &old, true)] {
+                        let base = text_x(measure(text, vf));
+                        for i in 0..text.len() {
+                            let changed = other.get(i) != Some(&text[i]);
+                            if !changed && !is_new {
+                                continue; // unchanged: drawn once, from the new text
+                            }
+                            let (dy, alpha) = match (changed, is_new) {
+                                (false, _) => (0, 1.0),
+                                (true, true) => (line - moved, p),
+                                (true, false) => (-moved, 1.0 - p),
+                            };
+                            let cx = measure(&text[..i], vf);
+                            segs.push(Seg {
+                                text: vec![text[i]],
+                                bold: true,
+                                small: inside,
+                                x: base + cx,
+                                w: measure(&text[..=i], vf) - cx,
+                                y0: top + dy,
+                                y1: top + dy + line,
+                                color: Rgba(color.0, color.1, color.2, color.3 * alpha),
+                                blur: if changed { blur } else { 0 },
+                                slack: 0,
+                            });
+                        }
+                    }
                 }
             }
             if ci + 1 < columns.len() {
@@ -284,8 +393,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, 0x00FFFFFF);
         for seg in &segs {
-            SelectObject(dc, if seg.bold { f_value } else { f_label });
-            let mut rc = RECT { left: seg.x, top: seg.y0, right: seg.x + seg.w + s(2.0), bottom: seg.y1 };
+            SelectObject(dc, if seg.small { f_small } else if seg.bold { f_value } else { f_label });
+            let mut rc = RECT { left: seg.x, top: seg.y0, right: seg.x + seg.w + seg.slack, bottom: seg.y1 };
             DrawTextW(dc, seg.text.as_ptr(), seg.text.len() as i32, &mut rc,
                 DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
         }
@@ -300,6 +409,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         DeleteDC(dc);
         DeleteObject(f_label);
         DeleteObject(f_value);
+        DeleteObject(f_small);
 
         // Compose (premultiplied floats).
         let mut buf = vec![[0f32; 4]; n];
@@ -337,9 +447,37 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             }
         }
 
+        // Usage rings: a faint track, then the filled arc clockwise from the top.
+        let rad = ring_d as f32 / 2.0;
+        let stroke = (ring_d as f32 * 0.1).max(1.5);
+        for r in &rings {
+            for y in 0..ring_d {
+                for xx in 0..ring_d {
+                    let (dx, dy) = (xx as f32 + 0.5 - rad, y as f32 + 0.5 - rad);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let band = (stroke / 2.0 + 0.5 - (d - (rad - stroke / 2.0)).abs()).clamp(0.0, 1.0);
+                    let i = (r.y + y) * w + r.x + xx;
+                    if band <= 0.0 || r.y + y < 0 || r.y + y >= h || i as usize >= n {
+                        continue;
+                    }
+                    over(&mut buf, i as usize, pal.divider, band);
+                    let a = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU);
+                    let arc = if r.frac >= 1.0 {
+                        1.0
+                    } else if r.frac <= 0.0 {
+                        0.0
+                    } else {
+                        // Distance along the ring to the arc's end, in pixels.
+                        ((r.frac * std::f32::consts::TAU - a) * d + 0.5).clamp(0.0, 1.0)
+                    };
+                    over(&mut buf, i as usize, r.color, band * arc);
+                }
+            }
+        }
+
         // Claude mark.
         let iy = (h - icon) / 2;
-        let mark = draw_mark(icon);
+        let mark = if m.pixel_icon { draw_pixel_mark(icon) } else { draw_mark(icon) };
         for y in 0..icon {
             for xx in 0..icon {
                 let cov = mark[(y * icon + xx) as usize];
@@ -350,9 +488,14 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         // Text.
         for seg in &segs {
             for y in seg.y0.max(0)..seg.y1.min(h) {
-                for xx in seg.x.max(0)..(seg.x + seg.w + s(2.0)).min(w) {
+                for xx in seg.x.max(0)..(seg.x + seg.w + seg.slack).min(w) {
                     let i = (y * w + xx) as usize;
-                    let cov = mask[i] as f32 / 255.0;
+                    // Motion blur: a vertical box average kept inside the glyph's own line box.
+                    let sum: u32 = (y - seg.blur..=y + seg.blur)
+                        .filter(|yy| (seg.y0.max(0)..seg.y1.min(h)).contains(yy))
+                        .map(|yy| mask[(yy * w + xx) as usize] as u32)
+                        .sum();
+                    let cov = sum as f32 / (255.0 * (2 * seg.blur + 1) as f32);
                     if cov > 0.0 {
                         over(&mut buf, i, seg.color, cov);
                     }
@@ -381,6 +524,39 @@ fn rounded_rect_cov(x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) ->
     let cy = y.clamp(t + rad, b - rad);
     let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - rad;
     (0.5 - d).clamp(0.0, 1.0)
+}
+
+/// Pixel-art mark (Claude Code's little creature), as wide as the asterisk.
+/// Cells may cover part of a pixel; edge pixels get the covered fraction.
+fn draw_pixel_mark(size: i32) -> Vec<f32> {
+    const ART: [&[u8; 12]; 8] = [
+        b"..########..",
+        b"..########..",
+        b"..#.####.#..",
+        b"############",
+        b"..########..",
+        b"..########..",
+        b"..#.#..#.#..",
+        b"..#.#..#.#..",
+    ];
+    let cell = size as f32 / 12.0;
+    let oy = (size as f32 - 8.0 * cell) / 2.0;
+    // How much of pixel `p` the span [a, b) covers.
+    let overlap = |p: i32, a: f32, b: f32| (b.min(p as f32 + 1.0) - a.max(p as f32)).max(0.0);
+    let mut out = vec![0f32; (size * size) as usize];
+    for (r, row) in ART.iter().enumerate() {
+        for (c, _) in row.iter().enumerate().filter(|(_, ch)| **ch == b'#') {
+            let (x0, y0) = (c as f32 * cell, oy + r as f32 * cell);
+            let (x1, y1) = (x0 + cell, y0 + cell);
+            for y in (y0.floor() as i32).max(0)..(y1.ceil() as i32).min(size) {
+                for x in (x0.floor() as i32).max(0)..(x1.ceil() as i32).min(size) {
+                    let v = &mut out[(y * size + x) as usize];
+                    *v = (*v + overlap(x, x0, x1) * overlap(y, y0, y1)).min(1.0);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Claude's asterisk-like mark: 12 rounded spokes of slightly varying length.

@@ -6,16 +6,16 @@ mod render;
 mod update;
 
 use http::wide;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::Registry::*;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows_sys::Win32::UI::Controls::*;
@@ -32,6 +32,9 @@ const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
 const WM_APP_UPDATE: u32 = WM_APP + 3; // update check or install finished; lparam: Box<UpdateMsg>
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
+const T_ROLL: usize = 5; // animation frames while numbers roll
+/// How long a changed number rolls.
+const ROLL_SECS: f32 = 0.45;
 const T_TICK: usize = 3; // refreshes tooltip countdowns
 const T_UPDATE: usize = 4; // one-shot: next check for a new release
 const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
@@ -45,11 +48,21 @@ const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
 const ID_HIDE_ICON: usize = 6;
 const ID_HIDE_LABELS: usize = 8;
+const ID_ON_LEFT: usize = 11;
+const ID_PIXEL_ICON: usize = 12;
+const ID_RINGS: usize = 13;
+const ID_RING_TEXT: usize = 14;
+const ID_ROLL: usize = 15;
+const ID_HIDE_FIVE: usize = 16;
+const ID_HIDE_WEEK: usize = 17;
+const ID_HIDE_FABLE: usize = 18;
+const ID_CLAUDE_ICON: usize = 19;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
 const DEFAULT_PER_COL: u32 = 2;
 const ID_FONT_BASE: usize = 200; // + index into FONT_SIZES
+const ID_ICON_SIZE_BASE: usize = 500; // + index into ICON_SIZES
 const ID_INTERVAL_BASE: usize = 100; // + index into INTERVALS
 
 /// Update interval choices (seconds, menu label).
@@ -73,6 +86,9 @@ const FONT_SIZES: [(u32, &str); 6] = [
     (16, "Larger"),
     (18, "Largest"),
 ];
+/// Icon size choices (pixels at 100% scaling, menu label).
+const ICON_SIZES: [(u32, &str); 4] = [(14, "Small"), (18, "Default"), (22, "Large"), (26, "Largest")];
+const DEFAULT_ICON_SIZE: u32 = 18;
 use render::DEFAULT_FONT_SIZE;
 
 const USAGE_URL: &str = "https://claude.ai/settings/usage";
@@ -86,12 +102,19 @@ struct RenderKey {
     dpi: u32,
     dark: bool,
     hover: bool,
-    /// Per account: rounded 5-hour %, weekly %, stale.
-    rows: Vec<(Option<i64>, Option<i64>, bool)>,
+    /// Per account: rounded 5-hour %, weekly %, Fable %, stale.
+    rows: Vec<(Option<i64>, Option<i64>, Option<i64>, bool, Option<u32>)>,
     show_left: bool,
     font_size: u32,
+    icon_size: u32,
     hide_icon: bool,
+    pixel_icon: bool,
+    rings: bool,
+    ring_text: bool,
     hide_labels: bool,
+    hide_five: bool,
+    hide_week: bool,
+    hide_fable: bool,
     rows_per_col: u32,
 }
 
@@ -103,6 +126,8 @@ struct Account {
     /// Email, or the folder name until it's known.
     label: String,
     usage: Option<api::Usage>,
+    /// While the numbers roll: the usage before the last update, and when it arrived.
+    prev: Option<(api::Usage, Instant)>,
     last_ok: Option<i64>,
     error: Option<String>,
     fetching: bool,
@@ -113,7 +138,7 @@ struct Account {
 impl Account {
     fn new(id: u32, dir: PathBuf) -> Account {
         let label = api::account_label(&dir);
-        Account { id, dir, label, usage: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
+        Account { id, dir, label, usage: None, prev: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
     }
 
     fn is_stale(&self) -> bool {
@@ -139,10 +164,25 @@ struct State {
     show_left: bool,
     /// Text size in pixels at 100% scaling.
     font_size: u32,
+    icon_size: u32,
     /// Leave out the Claude mark.
     hide_icon: bool,
     /// Leave out the `5h` / `W` labels.
     hide_labels: bool,
+    /// Sit at the taskbar's left end instead of next to the tray.
+    on_left: bool,
+    /// Pixel-art mark instead of the asterisk.
+    pixel_icon: bool,
+    /// A progress ring for each limit, and whether its number sits inside it.
+    rings: bool,
+    ring_text: bool,
+    /// Roll the digits when a number changes.
+    roll: bool,
+    /// Limits turned off in "Show/hide limits". The 5-hour and Fable groups
+    /// also hide on their own for plans without them.
+    hide_five: bool,
+    hide_week: bool,
+    hide_fable: bool,
     /// Accounts stacked in each column of the widget.
     rows_per_col: u32,
     /// claude-swap's `cswap.exe`, found once at launch.
@@ -161,7 +201,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -233,11 +273,22 @@ fn main() {
                 .filter(|v| (30..=1800).contains(v))
                 .unwrap_or(DEFAULT_INTERVAL);
             s.show_left = read_setting("ShowRemaining") == Some(1);
+            s.icon_size = read_setting("IconSize")
+                .filter(|v| ICON_SIZES.iter().any(|(px, _)| px == v))
+                .unwrap_or(DEFAULT_ICON_SIZE);
             s.font_size = read_setting("FontSize")
                 .filter(|v| FONT_SIZES.iter().any(|(f, _)| f == v))
                 .unwrap_or(DEFAULT_FONT_SIZE);
             s.hide_icon = read_setting("HideIcon") == Some(1);
             s.hide_labels = read_setting("HideLabels") == Some(1);
+            s.on_left = read_setting("OnLeft") == Some(1);
+            s.pixel_icon = read_setting("PixelIcon") == Some(1);
+            s.rings = read_setting("Rings") == Some(1);
+            s.ring_text = read_setting("RingText") == Some(1);
+            s.roll = read_setting("RollNumbers") == Some(1);
+            s.hide_five = read_setting("HideFiveHour") == Some(1);
+            s.hide_week = read_setting("HideWeekly") == Some(1);
+            s.hide_fable = read_setting("HideFable") == Some(1);
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -298,6 +349,7 @@ struct FetchResult {
 fn on_result(res: FetchResult) {
     let next = with(|s| {
         let interval = s.interval;
+        let roll = s.roll;
         // Ignore results for an account removed while it was fetching.
         let a = s.accounts.iter_mut().find(|a| a.id == res.id)?;
         a.fetching = false;
@@ -305,6 +357,7 @@ fn on_result(res: FetchResult) {
         let limited = matches!(res.r, Err(api::FetchError::RateLimited));
         match res.r {
             Ok(u) => {
+                a.prev = a.usage.filter(|_| roll).map(|old| (old, Instant::now()));
                 a.usage = Some(u);
                 a.last_ok = Some(now());
                 a.error = None;
@@ -319,7 +372,10 @@ fn on_result(res: FetchResult) {
         Some((s.ctl, backoff_secs(interval, a.rate_limited)))
     });
     if let Some((ctl, secs)) = next {
-        unsafe { SetTimer(ctl, T_FETCH_BASE + res.id as usize, secs * 1000, None) };
+        unsafe {
+            SetTimer(ctl, T_FETCH_BASE + res.id as usize, secs * 1000, None);
+            SetTimer(ctl, T_ROLL, 15, None); // stops itself once nothing rolls
+        }
     }
     ensure_widget();
     update_tooltip();
@@ -390,10 +446,20 @@ fn ensure_widget() {
                     render::Row {
                         five: u.five_hour.map(|l| l.percent),
                         week: u.weekly.map(|l| l.percent),
+                        fable: u.fable.map(|l| l.percent),
+                        roll: a.prev.and_then(|(o, at)| {
+                            let t = at.elapsed().as_secs_f32() / ROLL_SECS;
+                            let pct = |l: Option<api::Limit>| l.map(|l| l.percent);
+                            (t < 1.0).then_some(([pct(o.five_hour), pct(o.weekly), pct(o.fable)], t))
+                        }),
                         stale: a.is_stale(),
                     }
                 })
                 .collect();
+            // Plans without a 5-hour limit (Ultra) report none: hide the group
+            // on its own once every loaded account says so.
+            let mut loaded = s.accounts.iter().filter_map(|a| a.usage).peekable();
+            let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
                 dpi,
@@ -401,12 +467,22 @@ fn ensure_widget() {
                 hover: s.hover,
                 rows: rows
                     .iter()
-                    .map(|r| (r.five.map(|p| p.round() as i64), r.week.map(|p| p.round() as i64), r.stale))
+                    .map(|r| {
+                        let pct = |v: Option<f64>| v.map(|p| p.round() as i64);
+                        (pct(r.five), pct(r.week), pct(r.fable), r.stale, r.roll.map(|(_, t)| (t * 1000.0) as u32))
+                    })
                     .collect(),
                 show_left: s.show_left,
                 font_size: s.font_size,
+                icon_size: s.icon_size,
                 hide_icon: s.hide_icon,
+                pixel_icon: s.pixel_icon,
+                rings: s.rings,
+                ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
+                hide_five,
+                hide_week: s.hide_week,
+                hide_fable: s.hide_fable,
                 rows_per_col: s.rows_per_col,
             };
             let model = render::Model {
@@ -415,8 +491,15 @@ fn ensure_widget() {
                 dark: s.dark,
                 show_left: s.show_left,
                 font_size: s.font_size,
+                icon_size: s.icon_size,
                 hide_icon: s.hide_icon,
+                pixel_icon: s.pixel_icon,
+                rings: s.rings,
+                ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
+                hide_five,
+                hide_week: s.hide_week,
+                hide_fable: s.hide_fable,
                 rows_per_col: s.rows_per_col as usize,
             };
             let changed = s.rendered.as_ref() != Some(&key);
@@ -431,7 +514,9 @@ fn ensure_widget() {
             with(|s| s.rendered = Some(key));
         }
 
-        let x = tr.left - tb.left - w - (2.0 * scale) as i32;
+        let gap = (2.0 * scale) as i32;
+        // The left end is free on a centered taskbar (unless the Widgets button is on).
+        let x = if with(|s| s.on_left) { gap } else { tr.left - tb.left - w - gap };
         let pos = (x.max(0), 0, w, h);
         let moved = with(|s| {
             let changed = s.pos != pos;
@@ -547,8 +632,13 @@ fn tooltip_text(s: &State) -> String {
         }
         let u = a.usage.unwrap_or_default();
         if a.usage.is_some() {
-            out += &line("5-hour", u.five_hour, false);
+            if u.has_five_hour {
+                out += &line("5-hour", u.five_hour, false);
+            }
             out += &line("Weekly", u.weekly, true);
+            if u.fable.is_some() {
+                out += &line("Fable (weekly)", u.fable, true);
+            }
         }
         if let Some(t) = a.last_ok {
             out += &format!("\n{indent}Updated {}", local_time(t, false));
@@ -1043,30 +1133,46 @@ unsafe fn show_menu() {
     let menu = CreatePopupMenu();
     // Settings first, then the everyday actions next to Exit, closest to the
     // taskbar where the menu opens.
-    let (interval, show_left) = with(|s| (s.interval, s.show_left));
+    let tick = |id: usize| if setting_checked(id) == Some(true) { MF_STRING | MF_CHECKED } else { MF_STRING };
     let sub = CreatePopupMenu();
-    for (i, (secs, label)) in INTERVALS.iter().enumerate() {
-        let f = if *secs == interval { MF_STRING | MF_CHECKED } else { MF_STRING };
-        AppendMenuW(sub, f, ID_INTERVAL_BASE + i, wide(label).as_ptr());
+    for (i, (_, label)) in INTERVALS.iter().enumerate() {
+        AppendMenuW(sub, tick(ID_INTERVAL_BASE + i), ID_INTERVAL_BASE + i, wide(label).as_ptr());
     }
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
-    let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
-    AppendMenuW(menu, check(show_left), ID_SHOW_LEFT, w!("Show remaining instead of used"));
-    let (font_size, hide_icon, hide_labels) = with(|s| (s.font_size, s.hide_icon, s.hide_labels));
+    AppendMenuW(menu, tick(ID_SHOW_LEFT), ID_SHOW_LEFT, w!("Show remaining instead of used"));
     let custom = CreatePopupMenu();
     let fonts = CreatePopupMenu();
-    for (i, (px, label)) in FONT_SIZES.iter().enumerate() {
-        AppendMenuW(fonts, check(*px == font_size), ID_FONT_BASE + i, wide(label).as_ptr());
+    for (i, (_, label)) in FONT_SIZES.iter().enumerate() {
+        AppendMenuW(fonts, tick(ID_FONT_BASE + i), ID_FONT_BASE + i, wide(label).as_ptr());
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
-    AppendMenuW(custom, check(hide_icon), ID_HIDE_ICON, w!("Hide Claude icon"));
-    AppendMenuW(custom, check(hide_labels), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
+    let icon = CreatePopupMenu();
+    AppendMenuW(icon, tick(ID_HIDE_ICON), ID_HIDE_ICON, w!("Hide icon"));
+    AppendMenuW(icon, tick(ID_CLAUDE_ICON), ID_CLAUDE_ICON, w!("Show Claude icon"));
+    AppendMenuW(icon, tick(ID_PIXEL_ICON), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
+    AppendMenuW(icon, MF_SEPARATOR, 0, null());
+    let sizes = CreatePopupMenu();
+    for (i, (_, label)) in ICON_SIZES.iter().enumerate() {
+        AppendMenuW(sizes, tick(ID_ICON_SIZE_BASE + i), ID_ICON_SIZE_BASE + i, wide(label).as_ptr());
+    }
+    AppendMenuW(icon, MF_POPUP, sizes as usize, w!("Icon size"));
+    AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
+    AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
+    AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
+    AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
+    AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
+    let limits = CreatePopupMenu();
+    AppendMenuW(limits, tick(ID_HIDE_FIVE), ID_HIDE_FIVE, w!("5-hour"));
+    AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));
+    AppendMenuW(limits, tick(ID_HIDE_FABLE), ID_HIDE_FABLE, w!("Fable (weekly)"));
+    AppendMenuW(custom, MF_POPUP, limits as usize, w!("Show/hide limits"));
+    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, w!("Show on the left side"));
     // Only matters with more than one account.
-    let (per_col, n_accounts) = with(|s| (s.rows_per_col, s.accounts.len()));
+    let n_accounts = with(|s| s.accounts.len());
     let per = CreatePopupMenu();
-    for n in 1..=render::MAX_ROWS_PER_COLUMN as u32 {
+    for n in 1..=render::MAX_ROWS_PER_COLUMN {
         let text = wide(&n.to_string());
-        AppendMenuW(per, check(n == per_col), ID_PER_COL_BASE + n as usize, text.as_ptr());
+        AppendMenuW(per, tick(ID_PER_COL_BASE + n), ID_PER_COL_BASE + n, text.as_ptr());
     }
     let per_flags = if n_accounts > 1 { MF_POPUP } else { MF_POPUP | MF_GRAYED };
     AppendMenuW(custom, per_flags, per as usize, w!("Accounts per column"));
@@ -1084,7 +1190,7 @@ unsafe fn show_menu() {
         AppendMenuW(accounts, removable, ID_REMOVE_BASE + i, text.as_ptr());
     }
     AppendMenuW(menu, MF_POPUP, accounts as usize, w!("Accounts"));
-    AppendMenuW(menu, check(autostart_enabled()), ID_AUTOSTART, w!("Start with Windows"));
+    AppendMenuW(menu, tick(ID_AUTOSTART), ID_AUTOSTART, w!("Start with Windows"));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
     AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
@@ -1108,13 +1214,23 @@ unsafe fn show_menu() {
     AppendMenuW(menu, update_flags, ID_UPDATE, wide(&update_text).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
+    refresh_menu(menu);
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(ctl);
+    // Settings apply in place and leave the menu open; see `menu_filter`.
+    MENU.set(menu);
+    let hook = SetWindowsHookExW(WH_MSGFILTER, Some(menu_filter), null_mut(), GetCurrentThreadId());
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
         pt.x, pt.y, 0, ctl, null());
+    UnhookWindowsHookEx(hook);
+    MENU.set(null_mut());
     PostMessageW(ctl, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    // Enter on a setting still closes the menu and lands here.
+    if apply_setting(cmd as usize) {
+        return;
+    }
     match cmd as usize {
         ID_REFRESH => start_fetch_all(),
         ID_ADD_ACCOUNT => add_account(),
@@ -1126,47 +1242,6 @@ unsafe fn show_menu() {
             if let Some(exe) = cswap {
                 run_cswap_switch(exe);
             }
-        }
-        ID_AUTOSTART => set_autostart(!autostart_enabled()),
-        ID_SHOW_LEFT => {
-            let on = with(|s| {
-                s.show_left = !s.show_left;
-                s.show_left
-            });
-            write_setting("ShowRemaining", on as u32);
-            ensure_widget();
-        }
-        ID_HIDE_LABELS => {
-            let on = with(|s| {
-                s.hide_labels = !s.hide_labels;
-                s.hide_labels
-            });
-            write_setting("HideLabels", on as u32);
-            ensure_widget();
-        }
-        ID_HIDE_ICON => {
-            let on = with(|s| {
-                s.hide_icon = !s.hide_icon;
-                s.hide_icon
-            });
-            write_setting("HideIcon", on as u32);
-            ensure_widget();
-        }
-        id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
-            let n = (id - ID_PER_COL_BASE) as u32;
-            with(|s| s.rows_per_col = n);
-            write_setting("AccountsPerColumn", n);
-            ensure_widget();
-            update_tooltip();
-        }
-        id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
-            let px = FONT_SIZES[id - ID_FONT_BASE].0;
-            with(|s| s.font_size = px);
-            write_setting("FontSize", px);
-            ensure_widget();
-        }
-        id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
-            set_interval(INTERVALS[id - ID_INTERVAL_BASE].0);
         }
         ID_UPDATE => {
             if new_tag.is_some() {
@@ -1180,6 +1255,220 @@ unsafe fn show_menu() {
     }
 }
 
+thread_local! {
+    /// The context menu while it is open.
+    static MENU: Cell<HMENU> = const { Cell::new(null_mut()) };
+}
+
+/// Whether a setting's menu item is ticked, or None for items that are not settings.
+fn setting_checked(id: usize) -> Option<bool> {
+    if id == ID_AUTOSTART {
+        return Some(autostart_enabled());
+    }
+    with(|s| {
+        Some(match id {
+            ID_SHOW_LEFT => s.show_left,
+            ID_RINGS => s.rings,
+            ID_RING_TEXT => s.ring_text,
+            ID_ROLL => s.roll,
+            ID_HIDE_LABELS => s.hide_labels,
+            ID_ON_LEFT => s.on_left,
+            // Ticked limits are shown.
+            ID_HIDE_FIVE => !s.hide_five,
+            ID_HIDE_WEEK => !s.hide_week,
+            ID_HIDE_FABLE => !s.hide_fable,
+            ID_HIDE_ICON => s.hide_icon,
+            ID_CLAUDE_ICON => !s.hide_icon && !s.pixel_icon,
+            ID_PIXEL_ICON => !s.hide_icon && s.pixel_icon,
+            id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+                s.rows_per_col as usize == id - ID_PER_COL_BASE
+            }
+            id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
+                s.font_size == FONT_SIZES[id - ID_FONT_BASE].0
+            }
+            id if (ID_ICON_SIZE_BASE..ID_ICON_SIZE_BASE + ICON_SIZES.len()).contains(&id) => {
+                s.icon_size == ICON_SIZES[id - ID_ICON_SIZE_BASE].0
+            }
+            id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
+                s.interval == INTERVALS[id - ID_INTERVAL_BASE].0
+            }
+            _ => return None,
+        })
+    })
+}
+
+/// Applies a setting picked in the menu. Returns false for other items.
+fn apply_setting(id: usize) -> bool {
+    match id {
+        ID_AUTOSTART => set_autostart(!autostart_enabled()),
+        ID_SHOW_LEFT => {
+            let on = with(|s| {
+                s.show_left = !s.show_left;
+                s.show_left
+            });
+            write_setting("ShowRemaining", on as u32);
+            ensure_widget();
+        }
+        ID_RINGS => {
+            let on = with(|s| {
+                s.rings = !s.rings;
+                s.rings
+            });
+            write_setting("Rings", on as u32);
+            ensure_widget();
+        }
+        ID_RING_TEXT => {
+            let on = with(|s| {
+                s.ring_text = !s.ring_text;
+                s.ring_text
+            });
+            write_setting("RingText", on as u32);
+            ensure_widget();
+        }
+        ID_ROLL => {
+            let on = with(|s| {
+                s.roll = !s.roll;
+                s.roll
+            });
+            write_setting("RollNumbers", on as u32);
+        }
+        ID_HIDE_FIVE => {
+            let on = with(|s| {
+                s.hide_five = !s.hide_five;
+                s.hide_five
+            });
+            write_setting("HideFiveHour", on as u32);
+            ensure_widget();
+        }
+        ID_HIDE_WEEK => {
+            let on = with(|s| {
+                s.hide_week = !s.hide_week;
+                s.hide_week
+            });
+            write_setting("HideWeekly", on as u32);
+            ensure_widget();
+        }
+        ID_HIDE_FABLE => {
+            let on = with(|s| {
+                s.hide_fable = !s.hide_fable;
+                s.hide_fable
+            });
+            write_setting("HideFable", on as u32);
+            ensure_widget();
+        }
+        ID_ON_LEFT => {
+            let on = with(|s| {
+                s.on_left = !s.on_left;
+                s.on_left
+            });
+            write_setting("OnLeft", on as u32);
+            ensure_widget();
+        }
+        ID_HIDE_LABELS => {
+            let on = with(|s| {
+                s.hide_labels = !s.hide_labels;
+                s.hide_labels
+            });
+            write_setting("HideLabels", on as u32);
+            ensure_widget();
+        }
+        id @ (ID_HIDE_ICON | ID_CLAUDE_ICON | ID_PIXEL_ICON) => {
+            let (hide, pixel) = (id == ID_HIDE_ICON, id == ID_PIXEL_ICON);
+            with(|s| {
+                s.hide_icon = hide;
+                // Hiding keeps the chosen mark for when it is shown again.
+                if !hide {
+                    s.pixel_icon = pixel;
+                }
+            });
+            write_setting("HideIcon", hide as u32);
+            if !hide {
+                write_setting("PixelIcon", pixel as u32);
+            }
+            ensure_widget();
+        }
+        id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+            let n = (id - ID_PER_COL_BASE) as u32;
+            with(|s| s.rows_per_col = n);
+            write_setting("AccountsPerColumn", n);
+            ensure_widget();
+            update_tooltip();
+        }
+        id if (ID_ICON_SIZE_BASE..ID_ICON_SIZE_BASE + ICON_SIZES.len()).contains(&id) => {
+            let px = ICON_SIZES[id - ID_ICON_SIZE_BASE].0;
+            with(|s| s.icon_size = px);
+            write_setting("IconSize", px);
+            ensure_widget();
+        }
+        id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
+            let px = FONT_SIZES[id - ID_FONT_BASE].0;
+            with(|s| s.font_size = px);
+            write_setting("FontSize", px);
+            ensure_widget();
+        }
+        id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
+            set_interval(INTERVALS[id - ID_INTERVAL_BASE].0);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Brings the ticks up to date, and greys out "Numbers inside the rings" without rings.
+unsafe fn refresh_menu(menu: HMENU) {
+    for i in 0..GetMenuItemCount(menu) {
+        let sub = GetSubMenu(menu, i);
+        if !sub.is_null() {
+            refresh_menu(sub);
+            continue;
+        }
+        let id = GetMenuItemID(menu, i) as usize;
+        if let Some(on) = setting_checked(id) {
+            CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
+        }
+        if id == ID_RING_TEXT {
+            let on = with(|s| s.rings);
+            EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
+        }
+    }
+}
+
+/// Runs inside the menu's loop. A click on a setting applies it and updates
+/// the open menu instead of closing it; any other click goes on as usual.
+unsafe extern "system" fn menu_filter(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let m = &*(lp as *const MSG);
+    let up = matches!(m.message, WM_LBUTTONUP | WM_RBUTTONUP);
+    let dbl = matches!(m.message, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK);
+    if code == MSGF_MENU as i32 && (up || dbl) {
+        let hwnd = WindowFromPoint(m.pt);
+        let mut class = [0u16; 8];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        // Open menus are windows of class "#32768".
+        if String::from_utf16_lossy(&class[..n]) == "#32768" {
+            let menu = SendMessageW(hwnd, MN_GETHMENU, 0, 0) as HMENU;
+            let i = MenuItemFromPoint(null_mut(), menu, m.pt);
+            let usable = i >= 0 && GetMenuState(menu, i as u32, MF_BYPOSITION) & (MF_GRAYED | MF_DISABLED) == 0;
+            let id = if usable { GetMenuItemID(menu, i) as usize } else { 0 };
+            if dbl && setting_checked(id).is_some() {
+                // A quick second click arrives as a double-click, which the menu
+                // takes as a choice and closes; its button-up toggles again.
+                return 1;
+            }
+            if up && apply_setting(id) {
+                refresh_menu(MENU.get());
+                EnumThreadWindows(GetCurrentThreadId(), Some(repaint_menu), 0);
+                return 1;
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+unsafe extern "system" fn repaint_menu(hwnd: HWND, _: LPARAM) -> BOOL {
+    InvalidateRect(hwnd, null(), 1);
+    1
+}
+
 // ---------- window procs ----------
 
 unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1188,6 +1477,18 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_TIMER => {
             match wp {
                 T_LAYOUT => ensure_widget(),
+                T_ROLL => {
+                    let rolling = with(|s| {
+                        for a in &mut s.accounts {
+                            a.prev = a.prev.filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
+                        }
+                        s.accounts.iter().any(|a| a.prev.is_some())
+                    });
+                    if !rolling {
+                        KillTimer(hwnd, T_ROLL);
+                    }
+                    ensure_widget(); // the next frame, or the settled numbers
+                }
                 T_UPDATE => {
                     KillTimer(hwnd, T_UPDATE);
                     start_update_check(false);
@@ -1205,7 +1506,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                                     return false;
                                 }
                                 let u = a.usage.unwrap_or_default();
-                                [u.five_hour, u.weekly].iter().flatten().any(|l| {
+                                [u.five_hour, u.weekly, u.fable].iter().flatten().any(|l| {
                                     l.resets_at
                                         .is_some_and(|t| t < now() && a.last_ok.is_some_and(|ok| ok < t))
                                 })
