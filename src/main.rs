@@ -6,7 +6,7 @@ mod render;
 mod update;
 
 use http::wide;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows_sys::Win32::System::Registry::*;
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows_sys::Win32::UI::Controls::*;
@@ -1122,47 +1122,40 @@ unsafe fn show_menu() {
     let menu = CreatePopupMenu();
     // Settings first, then the everyday actions next to Exit, closest to the
     // taskbar where the menu opens.
-    let (interval, show_left) = with(|s| (s.interval, s.show_left));
+    let tick = |id: usize| if setting_checked(id) == Some(true) { MF_STRING | MF_CHECKED } else { MF_STRING };
     let sub = CreatePopupMenu();
-    for (i, (secs, label)) in INTERVALS.iter().enumerate() {
-        let f = if *secs == interval { MF_STRING | MF_CHECKED } else { MF_STRING };
-        AppendMenuW(sub, f, ID_INTERVAL_BASE + i, wide(label).as_ptr());
+    for (i, (_, label)) in INTERVALS.iter().enumerate() {
+        AppendMenuW(sub, tick(ID_INTERVAL_BASE + i), ID_INTERVAL_BASE + i, wide(label).as_ptr());
     }
     AppendMenuW(menu, MF_POPUP, sub as usize, w!("Update every"));
-    let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
-    AppendMenuW(menu, check(show_left), ID_SHOW_LEFT, w!("Show remaining instead of used"));
-    let (font_size, hide_icon, hide_labels) = with(|s| (s.font_size, s.hide_icon, s.hide_labels));
+    AppendMenuW(menu, tick(ID_SHOW_LEFT), ID_SHOW_LEFT, w!("Show remaining instead of used"));
     let custom = CreatePopupMenu();
     let fonts = CreatePopupMenu();
-    for (i, (px, label)) in FONT_SIZES.iter().enumerate() {
-        AppendMenuW(fonts, check(*px == font_size), ID_FONT_BASE + i, wide(label).as_ptr());
+    for (i, (_, label)) in FONT_SIZES.iter().enumerate() {
+        AppendMenuW(fonts, tick(ID_FONT_BASE + i), ID_FONT_BASE + i, wide(label).as_ptr());
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
     let icon = CreatePopupMenu();
-    let pixel = with(|s| s.pixel_icon);
-    AppendMenuW(icon, check(hide_icon), ID_HIDE_ICON, w!("Hide icon"));
-    AppendMenuW(icon, check(!hide_icon && !pixel), ID_CLAUDE_ICON, w!("Show Claude icon"));
-    AppendMenuW(icon, check(!hide_icon && pixel), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
+    AppendMenuW(icon, tick(ID_HIDE_ICON), ID_HIDE_ICON, w!("Hide icon"));
+    AppendMenuW(icon, tick(ID_CLAUDE_ICON), ID_CLAUDE_ICON, w!("Show Claude icon"));
+    AppendMenuW(icon, tick(ID_PIXEL_ICON), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
     AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
-    let (rings, ring_text) = with(|s| (s.rings, s.ring_text));
-    AppendMenuW(custom, check(rings), ID_RINGS, w!("Show usage rings"));
-    AppendMenuW(custom, check(ring_text) | if rings { 0 } else { MF_GRAYED }, ID_RING_TEXT, w!("Numbers inside the rings"));
-    AppendMenuW(custom, check(with(|s| s.roll)), ID_ROLL, w!("Roll numbers when they change"));
-    AppendMenuW(custom, check(hide_labels), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
-    // Ticked limits are shown.
+    AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
+    AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
+    AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
+    AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
     let limits = CreatePopupMenu();
-    let (five, week, fable) = with(|s| (!s.hide_five, !s.hide_week, !s.hide_fable));
-    AppendMenuW(limits, check(five), ID_HIDE_FIVE, w!("5-hour"));
-    AppendMenuW(limits, check(week), ID_HIDE_WEEK, w!("Weekly"));
-    AppendMenuW(limits, check(fable), ID_HIDE_FABLE, w!("Fable (weekly)"));
+    AppendMenuW(limits, tick(ID_HIDE_FIVE), ID_HIDE_FIVE, w!("5-hour"));
+    AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));
+    AppendMenuW(limits, tick(ID_HIDE_FABLE), ID_HIDE_FABLE, w!("Fable (weekly)"));
     AppendMenuW(custom, MF_POPUP, limits as usize, w!("Show/hide limits"));
-    AppendMenuW(custom, check(with(|s| s.on_left)), ID_ON_LEFT, w!("Show on the left side"));
+    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, w!("Show on the left side"));
     // Only matters with more than one account.
-    let (per_col, n_accounts) = with(|s| (s.rows_per_col, s.accounts.len()));
+    let n_accounts = with(|s| s.accounts.len());
     let per = CreatePopupMenu();
-    for n in 1..=render::MAX_ROWS_PER_COLUMN as u32 {
+    for n in 1..=render::MAX_ROWS_PER_COLUMN {
         let text = wide(&n.to_string());
-        AppendMenuW(per, check(n == per_col), ID_PER_COL_BASE + n as usize, text.as_ptr());
+        AppendMenuW(per, tick(ID_PER_COL_BASE + n), ID_PER_COL_BASE + n, text.as_ptr());
     }
     let per_flags = if n_accounts > 1 { MF_POPUP } else { MF_POPUP | MF_GRAYED };
     AppendMenuW(custom, per_flags, per as usize, w!("Accounts per column"));
@@ -1180,7 +1173,7 @@ unsafe fn show_menu() {
         AppendMenuW(accounts, removable, ID_REMOVE_BASE + i, text.as_ptr());
     }
     AppendMenuW(menu, MF_POPUP, accounts as usize, w!("Accounts"));
-    AppendMenuW(menu, check(autostart_enabled()), ID_AUTOSTART, w!("Start with Windows"));
+    AppendMenuW(menu, tick(ID_AUTOSTART), ID_AUTOSTART, w!("Start with Windows"));
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
     AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
@@ -1204,13 +1197,23 @@ unsafe fn show_menu() {
     AppendMenuW(menu, update_flags, ID_UPDATE, wide(&update_text).as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
+    refresh_menu(menu);
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(ctl);
+    // Settings apply in place and leave the menu open; see `menu_filter`.
+    MENU.set(menu);
+    let hook = SetWindowsHookExW(WH_MSGFILTER, Some(menu_filter), null_mut(), GetCurrentThreadId());
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
         pt.x, pt.y, 0, ctl, null());
+    UnhookWindowsHookEx(hook);
+    MENU.set(null_mut());
     PostMessageW(ctl, WM_NULL, 0, 0);
     DestroyMenu(menu);
+    // Enter on a setting still closes the menu and lands here.
+    if apply_setting(cmd as usize) {
+        return;
+    }
     match cmd as usize {
         ID_REFRESH => start_fetch_all(),
         ID_ADD_ACCOUNT => add_account(),
@@ -1223,6 +1226,60 @@ unsafe fn show_menu() {
                 run_cswap_switch(exe);
             }
         }
+        ID_UPDATE => {
+            if new_tag.is_some() {
+                start_update_install();
+            } else {
+                start_update_check(true);
+            }
+        }
+        ID_EXIT => quit(),
+        _ => {}
+    }
+}
+
+thread_local! {
+    /// The context menu while it is open.
+    static MENU: Cell<HMENU> = const { Cell::new(null_mut()) };
+}
+
+/// Whether a setting's menu item is ticked, or None for items that are not settings.
+fn setting_checked(id: usize) -> Option<bool> {
+    if id == ID_AUTOSTART {
+        return Some(autostart_enabled());
+    }
+    with(|s| {
+        Some(match id {
+            ID_SHOW_LEFT => s.show_left,
+            ID_RINGS => s.rings,
+            ID_RING_TEXT => s.ring_text,
+            ID_ROLL => s.roll,
+            ID_HIDE_LABELS => s.hide_labels,
+            ID_ON_LEFT => s.on_left,
+            // Ticked limits are shown.
+            ID_HIDE_FIVE => !s.hide_five,
+            ID_HIDE_WEEK => !s.hide_week,
+            ID_HIDE_FABLE => !s.hide_fable,
+            ID_HIDE_ICON => s.hide_icon,
+            ID_CLAUDE_ICON => !s.hide_icon && !s.pixel_icon,
+            ID_PIXEL_ICON => !s.hide_icon && s.pixel_icon,
+            id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
+                s.rows_per_col as usize == id - ID_PER_COL_BASE
+            }
+            id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
+                s.font_size == FONT_SIZES[id - ID_FONT_BASE].0
+            }
+            id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
+                s.interval == INTERVALS[id - ID_INTERVAL_BASE].0
+            }
+            _ => return None,
+        })
+    })
+}
+
+/// Applies a setting picked in the menu. Returns false for other items.
+fn apply_setting(id: usize) -> bool {
+    match id {
         ID_AUTOSTART => set_autostart(!autostart_enabled()),
         ID_SHOW_LEFT => {
             let on = with(|s| {
@@ -1326,16 +1383,64 @@ unsafe fn show_menu() {
         id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
             set_interval(INTERVALS[id - ID_INTERVAL_BASE].0);
         }
-        ID_UPDATE => {
-            if new_tag.is_some() {
-                start_update_install();
-            } else {
-                start_update_check(true);
+        _ => return false,
+    }
+    true
+}
+
+/// Brings the ticks up to date, and greys out "Numbers inside the rings" without rings.
+unsafe fn refresh_menu(menu: HMENU) {
+    for i in 0..GetMenuItemCount(menu) {
+        let sub = GetSubMenu(menu, i);
+        if !sub.is_null() {
+            refresh_menu(sub);
+            continue;
+        }
+        let id = GetMenuItemID(menu, i) as usize;
+        if let Some(on) = setting_checked(id) {
+            CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
+        }
+        if id == ID_RING_TEXT {
+            let on = with(|s| s.rings);
+            EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
+        }
+    }
+}
+
+/// Runs inside the menu's loop. A click on a setting applies it and updates
+/// the open menu instead of closing it; any other click goes on as usual.
+unsafe extern "system" fn menu_filter(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let m = &*(lp as *const MSG);
+    let up = matches!(m.message, WM_LBUTTONUP | WM_RBUTTONUP);
+    let dbl = matches!(m.message, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK);
+    if code == MSGF_MENU as i32 && (up || dbl) {
+        let hwnd = WindowFromPoint(m.pt);
+        let mut class = [0u16; 8];
+        let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32).max(0) as usize;
+        // Open menus are windows of class "#32768".
+        if String::from_utf16_lossy(&class[..n]) == "#32768" {
+            let menu = SendMessageW(hwnd, MN_GETHMENU, 0, 0) as HMENU;
+            let i = MenuItemFromPoint(null_mut(), menu, m.pt);
+            let usable = i >= 0 && GetMenuState(menu, i as u32, MF_BYPOSITION) & (MF_GRAYED | MF_DISABLED) == 0;
+            let id = if usable { GetMenuItemID(menu, i) as usize } else { 0 };
+            if dbl && setting_checked(id).is_some() {
+                // A quick second click arrives as a double-click, which the menu
+                // takes as a choice and closes; its button-up toggles again.
+                return 1;
+            }
+            if up && apply_setting(id) {
+                refresh_menu(MENU.get());
+                EnumThreadWindows(GetCurrentThreadId(), Some(repaint_menu), 0);
+                return 1;
             }
         }
-        ID_EXIT => quit(),
-        _ => {}
     }
+    CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+unsafe extern "system" fn repaint_menu(hwnd: HWND, _: LPARAM) -> BOOL {
+    InvalidateRect(hwnd, null(), 1);
+    1
 }
 
 // ---------- window procs ----------
