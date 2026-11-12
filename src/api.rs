@@ -30,6 +30,8 @@ pub struct Limit {
 #[derive(Clone, Copy, Default)]
 pub struct Usage {
     pub five_hour: Option<Limit>,
+    /// The plan has a 5-hour limit, even if this response gave no number for it.
+    pub has_five_hour: bool,
     pub weekly: Option<Limit>,
     /// Fable's own weekly limit, on plans that have one.
     pub fable: Option<Limit>,
@@ -267,6 +269,10 @@ pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
     }
     let v: Value = serde_json::from_slice(&resp.body)
         .map_err(|_| FetchError::Other("Bad usage response".into()))?;
+    Ok(parse_usage(&v))
+}
+
+fn parse_usage(v: &Value) -> Usage {
     let limit = |key: &str| -> Option<Limit> {
         let o = v.get(key)?;
         Some(Limit {
@@ -276,7 +282,12 @@ pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
     };
     // Per-model weekly limits come as a list, the way Claude Code reads them:
     // {kind: "weekly_scoped", scope: {model: {display_name}}, percent, resets_at}.
-    Ok(Usage { five_hour: limit("five_hour"), weekly: limit("seven_day"), fable: fable_limit(&v) })
+    Usage {
+        five_hour: limit("five_hour"),
+        has_five_hour: v["five_hour"].is_object(),
+        weekly: limit("seven_day"),
+        fable: fable_limit(v),
+    }
 }
 
 fn fable_limit(v: &Value) -> Option<Limit> {
@@ -335,6 +346,20 @@ mod tests {
         let l = super::fable_limit(&v).unwrap();
         assert_eq!((l.percent, l.resets_at), (41.5, Some(1794406200)));
         assert!(super::fable_limit(&serde_json::json!({"five_hour": null})).is_none());
+    }
+
+    #[test]
+    fn five_hour() {
+        let u = super::parse_usage(&serde_json::json!({"five_hour": {"utilization": 12.0}}));
+        assert!(u.has_five_hour && u.five_hour.unwrap().percent == 12.0);
+        // Limit there, number missing this time: keep the group, show "–".
+        let u = super::parse_usage(&serde_json::json!({"five_hour": {"utilization": null}}));
+        assert!(u.has_five_hour && u.five_hour.is_none());
+        // No 5-hour limit on the plan.
+        for v in [serde_json::json!({"five_hour": null}), serde_json::json!({})] {
+            let u = super::parse_usage(&v);
+            assert!(!u.has_five_hour && u.five_hour.is_none());
+        }
     }
 
     #[test]

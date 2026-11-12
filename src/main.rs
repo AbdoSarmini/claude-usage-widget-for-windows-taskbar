@@ -440,7 +440,7 @@ fn ensure_widget() {
             // Plans without a 5-hour limit (Ultra) report none: hide the group
             // on its own once every loaded account says so.
             let mut loaded = s.accounts.iter().filter_map(|a| a.usage).peekable();
-            let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| u.five_hour.is_none()));
+            let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
                 dpi,
@@ -607,7 +607,7 @@ fn tooltip_text(s: &State) -> String {
         }
         let u = a.usage.unwrap_or_default();
         if a.usage.is_some() {
-            if u.five_hour.is_some() {
+            if u.has_five_hour {
                 out += &line("5-hour", u.five_hour, false);
             }
             out += &line("Weekly", u.weekly, true);
