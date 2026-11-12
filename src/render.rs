@@ -82,6 +82,8 @@ pub struct Model {
     pub hide_icon: bool,
     /// Draw the pixel-art mark instead of the asterisk.
     pub pixel_icon: bool,
+    /// Icon size in pixels at 100% scaling.
+    pub icon_size: u32,
     /// Draw a progress ring for each limit.
     pub rings: bool,
     /// With rings: put the number inside a larger ring instead of beside a small one.
@@ -232,7 +234,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         let dim = |stale: bool, c: Rgba| if stale { Rgba(c.0, c.1, c.2, c.3 * 0.5) } else { c };
         let all_stale = rows.iter().all(|r| r.stale);
         let pad_l = s(8.0);
-        let icon = if m.hide_icon { 0 } else { s(18.0) };
+        let icon = if m.hide_icon { 0 } else { s(m.icon_size as f32).min(h) };
         let gap_icon = if m.hide_icon { 0 } else { s(7.0) };
         let gap_lv = if m.hide_labels { 0 } else { s(5.0) };
         let gap_div = s(10.0);
@@ -524,7 +526,8 @@ fn rounded_rect_cov(x: f32, y: f32, l: f32, t: f32, r: f32, b: f32, rad: f32) ->
     (0.5 - d).clamp(0.0, 1.0)
 }
 
-/// Pixel-art mark (Claude Code's little creature), in whole-pixel cells so it stays sharp.
+/// Pixel-art mark (Claude Code's little creature), as wide as the asterisk.
+/// Cells may cover part of a pixel; edge pixels get the covered fraction.
 fn draw_pixel_mark(size: i32) -> Vec<f32> {
     const ART: [&[u8; 12]; 8] = [
         b"..########..",
@@ -536,16 +539,19 @@ fn draw_pixel_mark(size: i32) -> Vec<f32> {
         b"..#.#..#.#..",
         b"..#.#..#.#..",
     ];
-    let cell = (size / 12).max(1);
-    let (ox, oy) = ((size - 12 * cell) / 2, (size - 8 * cell) / 2);
+    let cell = size as f32 / 12.0;
+    let oy = (size as f32 - 8.0 * cell) / 2.0;
+    // How much of pixel `p` the span [a, b) covers.
+    let overlap = |p: i32, a: f32, b: f32| (b.min(p as f32 + 1.0) - a.max(p as f32)).max(0.0);
     let mut out = vec![0f32; (size * size) as usize];
     for (r, row) in ART.iter().enumerate() {
         for (c, _) in row.iter().enumerate().filter(|(_, ch)| **ch == b'#') {
-            for y in oy + r as i32 * cell..oy + (r as i32 + 1) * cell {
-                for x in ox + c as i32 * cell..ox + (c as i32 + 1) * cell {
-                    if (0..size).contains(&x) && (0..size).contains(&y) {
-                        out[(y * size + x) as usize] = 1.0;
-                    }
+            let (x0, y0) = (c as f32 * cell, oy + r as f32 * cell);
+            let (x1, y1) = (x0 + cell, y0 + cell);
+            for y in (y0.floor() as i32).max(0)..(y1.ceil() as i32).min(size) {
+                for x in (x0.floor() as i32).max(0)..(x1.ceil() as i32).min(size) {
+                    let v = &mut out[(y * size + x) as usize];
+                    *v = (*v + overlap(x, x0, x1) * overlap(y, y0, y1)).min(1.0);
                 }
             }
         }

@@ -54,7 +54,7 @@ One small file (~450 KB). No installer, no runtime, nothing else to download.
 | Right-click → **Update every** | 30 s, 1, 2, 5, 10, 15 or 30 minutes (default: 2 minutes) |
 | Right-click → **Show remaining instead of used** | Shows `75%` left instead of `25%` used |
 | Right-click → **Customize → Font size** | Six text sizes, from Smallest to Largest |
-| Right-click → **Customize → Icon** | Choose **Hide icon** (numbers only), **Show Claude icon** or **Show pixel Claude icon** |
+| Right-click → **Customize → Icon** | Choose **Hide icon** (numbers only), **Show Claude icon** or **Show pixel Claude icon**, and the **Icon size** |
 | Right-click → **Customize → Hide labels** | Leaves out the `5h` / `W` / `F` labels and shows only the percentages, making the widget narrower |
 | Right-click → **Customize → Show/hide limits** | Turns the 5-hour, weekly and Fable numbers on or off. The 5-hour group also hides on its own for accounts without a 5-hour limit (Ultra), and the Fable group for accounts without a Fable limit |
 | Right-click → **Customize → Show usage rings** | Adds a progress ring next to each number |

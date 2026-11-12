@@ -62,6 +62,7 @@ const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
 const DEFAULT_PER_COL: u32 = 2;
 const ID_FONT_BASE: usize = 200; // + index into FONT_SIZES
+const ID_ICON_SIZE_BASE: usize = 500; // + index into ICON_SIZES
 const ID_INTERVAL_BASE: usize = 100; // + index into INTERVALS
 
 /// Update interval choices (seconds, menu label).
@@ -85,6 +86,9 @@ const FONT_SIZES: [(u32, &str); 6] = [
     (16, "Larger"),
     (18, "Largest"),
 ];
+/// Icon size choices (pixels at 100% scaling, menu label).
+const ICON_SIZES: [(u32, &str); 4] = [(14, "Small"), (18, "Default"), (22, "Large"), (26, "Largest")];
+const DEFAULT_ICON_SIZE: u32 = 18;
 use render::DEFAULT_FONT_SIZE;
 
 const USAGE_URL: &str = "https://claude.ai/settings/usage";
@@ -102,6 +106,7 @@ struct RenderKey {
     rows: Vec<(Option<i64>, Option<i64>, Option<i64>, bool, Option<u32>)>,
     show_left: bool,
     font_size: u32,
+    icon_size: u32,
     hide_icon: bool,
     pixel_icon: bool,
     rings: bool,
@@ -159,6 +164,7 @@ struct State {
     show_left: bool,
     /// Text size in pixels at 100% scaling.
     font_size: u32,
+    icon_size: u32,
     /// Leave out the Claude mark.
     hide_icon: bool,
     /// Leave out the `5h` / `W` labels.
@@ -195,7 +201,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -267,6 +273,9 @@ fn main() {
                 .filter(|v| (30..=1800).contains(v))
                 .unwrap_or(DEFAULT_INTERVAL);
             s.show_left = read_setting("ShowRemaining") == Some(1);
+            s.icon_size = read_setting("IconSize")
+                .filter(|v| ICON_SIZES.iter().any(|(px, _)| px == v))
+                .unwrap_or(DEFAULT_ICON_SIZE);
             s.font_size = read_setting("FontSize")
                 .filter(|v| FONT_SIZES.iter().any(|(f, _)| f == v))
                 .unwrap_or(DEFAULT_FONT_SIZE);
@@ -465,6 +474,7 @@ fn ensure_widget() {
                     .collect(),
                 show_left: s.show_left,
                 font_size: s.font_size,
+                icon_size: s.icon_size,
                 hide_icon: s.hide_icon,
                 pixel_icon: s.pixel_icon,
                 rings: s.rings,
@@ -481,6 +491,7 @@ fn ensure_widget() {
                 dark: s.dark,
                 show_left: s.show_left,
                 font_size: s.font_size,
+                icon_size: s.icon_size,
                 hide_icon: s.hide_icon,
                 pixel_icon: s.pixel_icon,
                 rings: s.rings,
@@ -1139,6 +1150,12 @@ unsafe fn show_menu() {
     AppendMenuW(icon, tick(ID_HIDE_ICON), ID_HIDE_ICON, w!("Hide icon"));
     AppendMenuW(icon, tick(ID_CLAUDE_ICON), ID_CLAUDE_ICON, w!("Show Claude icon"));
     AppendMenuW(icon, tick(ID_PIXEL_ICON), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
+    AppendMenuW(icon, MF_SEPARATOR, 0, null());
+    let sizes = CreatePopupMenu();
+    for (i, (_, label)) in ICON_SIZES.iter().enumerate() {
+        AppendMenuW(sizes, tick(ID_ICON_SIZE_BASE + i), ID_ICON_SIZE_BASE + i, wide(label).as_ptr());
+    }
+    AppendMenuW(icon, MF_POPUP, sizes as usize, w!("Icon size"));
     AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
     AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
     AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
@@ -1269,6 +1286,9 @@ fn setting_checked(id: usize) -> Option<bool> {
             id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
                 s.font_size == FONT_SIZES[id - ID_FONT_BASE].0
             }
+            id if (ID_ICON_SIZE_BASE..ID_ICON_SIZE_BASE + ICON_SIZES.len()).contains(&id) => {
+                s.icon_size == ICON_SIZES[id - ID_ICON_SIZE_BASE].0
+            }
             id if (ID_INTERVAL_BASE..ID_INTERVAL_BASE + INTERVALS.len()).contains(&id) => {
                 s.interval == INTERVALS[id - ID_INTERVAL_BASE].0
             }
@@ -1373,6 +1393,12 @@ fn apply_setting(id: usize) -> bool {
             write_setting("AccountsPerColumn", n);
             ensure_widget();
             update_tooltip();
+        }
+        id if (ID_ICON_SIZE_BASE..ID_ICON_SIZE_BASE + ICON_SIZES.len()).contains(&id) => {
+            let px = ICON_SIZES[id - ID_ICON_SIZE_BASE].0;
+            with(|s| s.icon_size = px);
+            write_setting("IconSize", px);
+            ensure_widget();
         }
         id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
             let px = FONT_SIZES[id - ID_FONT_BASE].0;
