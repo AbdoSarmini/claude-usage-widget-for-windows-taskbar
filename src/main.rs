@@ -9,7 +9,7 @@ use http::wide;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -32,6 +32,9 @@ const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_CSWAP: u32 = WM_APP + 2; // claude-swap finished; lparam: Box<Result<(), String>>
 const WM_APP_UPDATE: u32 = WM_APP + 3; // update check or install finished; lparam: Box<UpdateMsg>
 const T_LAYOUT: usize = 1; // keeps the widget attached and positioned
+const T_ROLL: usize = 5; // animation frames while numbers roll
+/// How long a changed number rolls.
+const ROLL_SECS: f32 = 0.45;
 const T_TICK: usize = 3; // refreshes tooltip countdowns
 const T_UPDATE: usize = 4; // one-shot: next check for a new release
 const T_FETCH_BASE: usize = 1000; // + account id, one-shot: that account's next fetch
@@ -45,6 +48,11 @@ const ID_EXIT: usize = 4;
 const ID_SHOW_LEFT: usize = 5;
 const ID_HIDE_ICON: usize = 6;
 const ID_HIDE_LABELS: usize = 8;
+const ID_ON_LEFT: usize = 11;
+const ID_PIXEL_ICON: usize = 12;
+const ID_RINGS: usize = 13;
+const ID_RING_TEXT: usize = 14;
+const ID_ROLL: usize = 15;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -86,11 +94,14 @@ struct RenderKey {
     dpi: u32,
     dark: bool,
     hover: bool,
-    /// Per account: rounded 5-hour %, weekly %, stale.
-    rows: Vec<(Option<i64>, Option<i64>, bool)>,
+    /// Per account: rounded 5-hour %, weekly %, Fable %, stale.
+    rows: Vec<(Option<i64>, Option<i64>, Option<i64>, bool, Option<u32>)>,
     show_left: bool,
     font_size: u32,
     hide_icon: bool,
+    pixel_icon: bool,
+    rings: bool,
+    ring_text: bool,
     hide_labels: bool,
     rows_per_col: u32,
 }
@@ -103,6 +114,8 @@ struct Account {
     /// Email, or the folder name until it's known.
     label: String,
     usage: Option<api::Usage>,
+    /// While the numbers roll: the usage before the last update, and when it arrived.
+    prev: Option<(api::Usage, Instant)>,
     last_ok: Option<i64>,
     error: Option<String>,
     fetching: bool,
@@ -113,7 +126,7 @@ struct Account {
 impl Account {
     fn new(id: u32, dir: PathBuf) -> Account {
         let label = api::account_label(&dir);
-        Account { id, dir, label, usage: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
+        Account { id, dir, label, usage: None, prev: None, last_ok: None, error: None, fetching: false, rate_limited: 0 }
     }
 
     fn is_stale(&self) -> bool {
@@ -143,6 +156,15 @@ struct State {
     hide_icon: bool,
     /// Leave out the `5h` / `W` labels.
     hide_labels: bool,
+    /// Sit at the taskbar's left end instead of next to the tray.
+    on_left: bool,
+    /// Pixel-art mark instead of the asterisk.
+    pixel_icon: bool,
+    /// A progress ring for each limit, and whether its number sits inside it.
+    rings: bool,
+    ring_text: bool,
+    /// Roll the digits when a number changes.
+    roll: bool,
     /// Accounts stacked in each column of the widget.
     rows_per_col: u32,
     /// claude-swap's `cswap.exe`, found once at launch.
@@ -161,7 +183,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -238,6 +260,11 @@ fn main() {
                 .unwrap_or(DEFAULT_FONT_SIZE);
             s.hide_icon = read_setting("HideIcon") == Some(1);
             s.hide_labels = read_setting("HideLabels") == Some(1);
+            s.on_left = read_setting("OnLeft") == Some(1);
+            s.pixel_icon = read_setting("PixelIcon") == Some(1);
+            s.rings = read_setting("Rings") == Some(1);
+            s.ring_text = read_setting("RingText") == Some(1);
+            s.roll = read_setting("RollNumbers") == Some(1);
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -298,6 +325,7 @@ struct FetchResult {
 fn on_result(res: FetchResult) {
     let next = with(|s| {
         let interval = s.interval;
+        let roll = s.roll;
         // Ignore results for an account removed while it was fetching.
         let a = s.accounts.iter_mut().find(|a| a.id == res.id)?;
         a.fetching = false;
@@ -305,6 +333,7 @@ fn on_result(res: FetchResult) {
         let limited = matches!(res.r, Err(api::FetchError::RateLimited));
         match res.r {
             Ok(u) => {
+                a.prev = a.usage.filter(|_| roll).map(|old| (old, Instant::now()));
                 a.usage = Some(u);
                 a.last_ok = Some(now());
                 a.error = None;
@@ -319,7 +348,10 @@ fn on_result(res: FetchResult) {
         Some((s.ctl, backoff_secs(interval, a.rate_limited)))
     });
     if let Some((ctl, secs)) = next {
-        unsafe { SetTimer(ctl, T_FETCH_BASE + res.id as usize, secs * 1000, None) };
+        unsafe {
+            SetTimer(ctl, T_FETCH_BASE + res.id as usize, secs * 1000, None);
+            SetTimer(ctl, T_ROLL, 15, None); // stops itself once nothing rolls
+        }
     }
     ensure_widget();
     update_tooltip();
@@ -390,6 +422,12 @@ fn ensure_widget() {
                     render::Row {
                         five: u.five_hour.map(|l| l.percent),
                         week: u.weekly.map(|l| l.percent),
+                        fable: u.fable.map(|l| l.percent),
+                        roll: a.prev.and_then(|(o, at)| {
+                            let t = at.elapsed().as_secs_f32() / ROLL_SECS;
+                            let pct = |l: Option<api::Limit>| l.map(|l| l.percent);
+                            (t < 1.0).then_some(([pct(o.five_hour), pct(o.weekly), pct(o.fable)], t))
+                        }),
                         stale: a.is_stale(),
                     }
                 })
@@ -401,11 +439,17 @@ fn ensure_widget() {
                 hover: s.hover,
                 rows: rows
                     .iter()
-                    .map(|r| (r.five.map(|p| p.round() as i64), r.week.map(|p| p.round() as i64), r.stale))
+                    .map(|r| {
+                        let pct = |v: Option<f64>| v.map(|p| p.round() as i64);
+                        (pct(r.five), pct(r.week), pct(r.fable), r.stale, r.roll.map(|(_, t)| (t * 1000.0) as u32))
+                    })
                     .collect(),
                 show_left: s.show_left,
                 font_size: s.font_size,
                 hide_icon: s.hide_icon,
+                pixel_icon: s.pixel_icon,
+                rings: s.rings,
+                ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
                 rows_per_col: s.rows_per_col,
             };
@@ -416,6 +460,9 @@ fn ensure_widget() {
                 show_left: s.show_left,
                 font_size: s.font_size,
                 hide_icon: s.hide_icon,
+                pixel_icon: s.pixel_icon,
+                rings: s.rings,
+                ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
                 rows_per_col: s.rows_per_col as usize,
             };
@@ -431,7 +478,9 @@ fn ensure_widget() {
             with(|s| s.rendered = Some(key));
         }
 
-        let x = tr.left - tb.left - w - (2.0 * scale) as i32;
+        let gap = (2.0 * scale) as i32;
+        // The left end is free on a centered taskbar (unless the Widgets button is on).
+        let x = if with(|s| s.on_left) { gap } else { tr.left - tb.left - w - gap };
         let pos = (x.max(0), 0, w, h);
         let moved = with(|s| {
             let changed = s.pos != pos;
@@ -549,6 +598,9 @@ fn tooltip_text(s: &State) -> String {
         if a.usage.is_some() {
             out += &line("5-hour", u.five_hour, false);
             out += &line("Weekly", u.weekly, true);
+            if u.fable.is_some() {
+                out += &line("Fable (weekly)", u.fable, true);
+            }
         }
         if let Some(t) = a.last_ok {
             out += &format!("\n{indent}Updated {}", local_time(t, false));
@@ -1060,7 +1112,13 @@ unsafe fn show_menu() {
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
     AppendMenuW(custom, check(hide_icon), ID_HIDE_ICON, w!("Hide Claude icon"));
+    AppendMenuW(custom, check(with(|s| s.pixel_icon)), ID_PIXEL_ICON, w!("Pixel Claude icon"));
+    let (rings, ring_text) = with(|s| (s.rings, s.ring_text));
+    AppendMenuW(custom, check(rings), ID_RINGS, w!("Show usage rings"));
+    AppendMenuW(custom, check(ring_text) | if rings { 0 } else { MF_GRAYED }, ID_RING_TEXT, w!("Numbers inside the rings"));
+    AppendMenuW(custom, check(with(|s| s.roll)), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, check(hide_labels), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
+    AppendMenuW(custom, check(with(|s| s.on_left)), ID_ON_LEFT, w!("Show on the left side"));
     // Only matters with more than one account.
     let (per_col, n_accounts) = with(|s| (s.rows_per_col, s.accounts.len()));
     let per = CreatePopupMenu();
@@ -1136,6 +1194,45 @@ unsafe fn show_menu() {
             write_setting("ShowRemaining", on as u32);
             ensure_widget();
         }
+        ID_RINGS => {
+            let on = with(|s| {
+                s.rings = !s.rings;
+                s.rings
+            });
+            write_setting("Rings", on as u32);
+            ensure_widget();
+        }
+        ID_RING_TEXT => {
+            let on = with(|s| {
+                s.ring_text = !s.ring_text;
+                s.ring_text
+            });
+            write_setting("RingText", on as u32);
+            ensure_widget();
+        }
+        ID_ROLL => {
+            let on = with(|s| {
+                s.roll = !s.roll;
+                s.roll
+            });
+            write_setting("RollNumbers", on as u32);
+        }
+        ID_PIXEL_ICON => {
+            let on = with(|s| {
+                s.pixel_icon = !s.pixel_icon;
+                s.pixel_icon
+            });
+            write_setting("PixelIcon", on as u32);
+            ensure_widget();
+        }
+        ID_ON_LEFT => {
+            let on = with(|s| {
+                s.on_left = !s.on_left;
+                s.on_left
+            });
+            write_setting("OnLeft", on as u32);
+            ensure_widget();
+        }
         ID_HIDE_LABELS => {
             let on = with(|s| {
                 s.hide_labels = !s.hide_labels;
@@ -1188,6 +1285,18 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_TIMER => {
             match wp {
                 T_LAYOUT => ensure_widget(),
+                T_ROLL => {
+                    let rolling = with(|s| {
+                        for a in &mut s.accounts {
+                            a.prev = a.prev.filter(|(_, at)| at.elapsed().as_secs_f32() < ROLL_SECS);
+                        }
+                        s.accounts.iter().any(|a| a.prev.is_some())
+                    });
+                    if !rolling {
+                        KillTimer(hwnd, T_ROLL);
+                    }
+                    ensure_widget(); // the next frame, or the settled numbers
+                }
                 T_UPDATE => {
                     KillTimer(hwnd, T_UPDATE);
                     start_update_check(false);
@@ -1205,7 +1314,7 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                                     return false;
                                 }
                                 let u = a.usage.unwrap_or_default();
-                                [u.five_hour, u.weekly].iter().flatten().any(|l| {
+                                [u.five_hour, u.weekly, u.fable].iter().flatten().any(|l| {
                                     l.resets_at
                                         .is_some_and(|t| t < now() && a.last_ok.is_some_and(|ok| ok < t))
                                 })

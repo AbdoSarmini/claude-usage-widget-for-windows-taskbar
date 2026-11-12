@@ -31,6 +31,8 @@ pub struct Limit {
 pub struct Usage {
     pub five_hour: Option<Limit>,
     pub weekly: Option<Limit>,
+    /// Fable's own weekly limit, on plans that have one.
+    pub fable: Option<Limit>,
 }
 
 pub enum FetchError {
@@ -272,7 +274,23 @@ pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
             resets_at: o.get("resets_at").and_then(Value::as_str).and_then(parse_iso8601),
         })
     };
-    Ok(Usage { five_hour: limit("five_hour"), weekly: limit("seven_day") })
+    // Per-model weekly limits come as a list, the way Claude Code reads them:
+    // {kind: "weekly_scoped", scope: {model: {display_name}}, percent, resets_at}.
+    Ok(Usage { five_hour: limit("five_hour"), weekly: limit("seven_day"), fable: fable_limit(&v) })
+}
+
+fn fable_limit(v: &Value) -> Option<Limit> {
+    v["limits"].as_array()?.iter().find_map(|l| {
+        let name = l["scope"]["model"]["display_name"].as_str()?;
+        if l["kind"].as_str() != Some("weekly_scoped") || !name.to_ascii_lowercase().contains("fable") {
+            return None;
+        }
+        let at = &l["resets_at"];
+        Some(Limit {
+            percent: l["percent"].as_f64()?,
+            resets_at: at.as_i64().or_else(|| at.as_str().and_then(parse_iso8601)),
+        })
+    })
 }
 
 /// Parses e.g. "2026-11-11T14:10:00.320228+00:00" into unix seconds.
@@ -308,6 +326,17 @@ fn parse_iso8601(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fable() {
+        let v = serde_json::json!({"limits": [
+            {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Opus"}}, "percent": 9.0},
+            {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}}, "percent": 41.5, "resets_at": 1794406200},
+        ]});
+        let l = super::fable_limit(&v).unwrap();
+        assert_eq!((l.percent, l.resets_at), (41.5, Some(1794406200)));
+        assert!(super::fable_limit(&serde_json::json!({"five_hour": null})).is_none());
+    }
+
     #[test]
     fn iso() {
         assert_eq!(super::parse_iso8601("1970-01-01T00:00:00Z"), Some(0));

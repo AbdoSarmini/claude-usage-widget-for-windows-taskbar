@@ -56,6 +56,11 @@ One small file (~450 KB). No installer, no runtime, nothing else to download.
 | Right-click → **Customize → Font size** | Six text sizes, from Smallest to Largest |
 | Right-click → **Customize → Hide Claude icon** | Shows only the numbers, without the Claude mark |
 | Right-click → **Customize → Hide 5h / W labels** | Shows only the percentages (5-hour first, then weekly), making the widget narrower |
+| Right-click → **Customize → Pixel Claude icon** | Swaps the Claude mark for a pixel-art one |
+| Right-click → **Customize → Show usage rings** | Adds a progress ring next to each number |
+| Right-click → **Customize → Numbers inside the rings** | Larger rings with the percentage inside (needs rings on) |
+| Right-click → **Customize → Roll numbers when they change** | Changed digits roll to their new value with a little motion blur |
+| Right-click → **Customize → Show on the left side** | Puts the widget at the taskbar's left end instead of next to the tray (for centered taskbars, or when something else sits by the tray) |
 | Right-click → **Customize → Accounts per column** | 1, 2 or 3 accounts stacked per column (default: 2; needs more than one account) |
 | Right-click → **Accounts → Add account…** | Adds another Claude Code login (see [Multiple accounts](#multiple-accounts)) |
 | Right-click → **Accounts → Remove …** | Takes an account off the widget (doesn't sign it out) |
