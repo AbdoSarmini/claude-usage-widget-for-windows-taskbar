@@ -1,3 +1,5 @@
+[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/AbdoSarmini/claude-usage-widget-for-windows-taskbar/total?style=for-the-badge&logo=claudecode&logoColor=white&labelColor=%23C15F3C)
+](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar/releases/latest/download/ClaudeUsageWidget.exe)
 # Claude Usage Widget For Windows Taskbar
 
 See your Claude **5-hour** and **weekly** usage right on the Windows 11 taskbar, next to the clock.
@@ -7,7 +9,7 @@ See your Claude **5-hour** and **weekly** usage right on the Windows 11 taskbar,
   <img src="docs/screenshot-dark.png" alt="Widget on a dark taskbar" width="490">
 </p>
 
-### ⬇️ [Download ClaudeUsageWidget.exe](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar/releases/latest/download/ClaudeUsageWidget.exe)
+### ⬇️ [Download The App: ClaudeUsageWidget.exe](https://github.com/AbdoSarmini/claude-usage-widget-for-windows-taskbar/releases/latest/download/ClaudeUsageWidget.exe)
 
 One small file (~450 KB). No installer, no runtime, nothing else to download.
 
