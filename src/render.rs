@@ -88,6 +88,8 @@ pub struct Model {
     pub ring_text: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
+    /// Leave out the 5-hour group (plans without that limit).
+    pub hide_five: bool,
     /// Accounts stacked per column (1 to MAX_ROWS_PER_COLUMN); more start a new column.
     pub rows_per_col: usize,
 }
@@ -247,14 +249,21 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         for (ci, col) in columns.iter().enumerate() {
             // Line the column's rows up: each field is as wide as its widest value.
             let labels = [enc("5h"), enc("W"), enc("F")];
-            let groups = if rows.iter().any(|r| r.fable.is_some()) { 3 } else { 2 };
-            let label_w: Vec<i32> = labels[..groups]
+            // Which of 5h / week / Fable are shown, as indexes into `labels`.
+            let ids: Vec<usize> = [!m.hide_five, true, rows.iter().any(|r| r.fable.is_some())]
                 .iter()
+                .enumerate()
+                .filter_map(|(k, on)| on.then_some(k))
+                .collect();
+            let groups = ids.len();
+            let label_w: Vec<i32> = ids
+                .iter()
+                .map(|&k| &labels[k])
                 .map(|l| if m.hide_labels { 0 } else { measure(l, f_label) })
                 .collect();
             let values: Vec<Vec<Vec<u16>>> = col
                 .iter()
-                .map(|r| [r.five, r.week, r.fable][..groups].iter().map(|v| enc(&value_text(*v, m.show_left))).collect())
+                .map(|r| ids.iter().map(|&k| enc(&value_text([r.five, r.week, r.fable][k], m.show_left))).collect())
                 .collect();
             let mut value_w = vec![0; groups];
             for v in &values {
@@ -285,9 +294,9 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                     None => (1.0, 0.0),
                 };
                 for g in 0..groups {
-                    let val = [row.five, row.week, row.fable][g];
+                    let val = [row.five, row.week, row.fable][ids[g]];
                     if !m.hide_labels {
-                        segs.push(Seg { text: labels[g].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
+                        segs.push(Seg { text: labels[ids[g]].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
                     }
                     let dy = y0 + ((y1 - y0) - div_h) / 2;
                     dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
@@ -303,7 +312,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                         rings.push(Ring {
                             x: content_x,
                             y: y0 + ((y1 - y0) - ring_d) / 2,
-                            frac: row.roll.map_or(to, |(from, _)| frac(from[g]) + (to - frac(from[g])) * p),
+                            frac: row.roll.map_or(to, |(from, _)| frac(from[ids[g]]) + (to - frac(from[ids[g]])) * p),
                             color: dim(row.stale, if color == pal.value { RING_BLUE } else { color }),
                         });
                     }
@@ -312,7 +321,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                     let color = dim(row.stale, color);
                     let old = row
                         .roll
-                        .map(|(from, _)| enc(&value_text(from[g], m.show_left)))
+                        .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left)))
                         .filter(|o| *o != vals[g]);
                     let Some(old) = old else {
                         let vw = measure(&vals[g], vf);

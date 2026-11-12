@@ -56,6 +56,7 @@ One small file (~450 KB). No installer, no runtime, nothing else to download.
 | Right-click → **Customize → Font size** | Six text sizes, from Smallest to Largest |
 | Right-click → **Customize → Hide Claude icon** | Shows only the numbers, without the Claude mark |
 | Right-click → **Customize → Hide 5h / W labels** | Shows only the percentages (5-hour first, then weekly), making the widget narrower |
+| Right-click → **Customize → Hide 5-hour usage** | Leaves out the 5-hour number. Hidden on its own for accounts without a 5-hour limit (Ultra) |
 | Right-click → **Customize → Pixel Claude icon** | Swaps the Claude mark for a pixel-art one |
 | Right-click → **Customize → Show usage rings** | Adds a progress ring next to each number |
 | Right-click → **Customize → Numbers inside the rings** | Larger rings with the percentage inside (needs rings on) |

@@ -53,6 +53,7 @@ const ID_PIXEL_ICON: usize = 12;
 const ID_RINGS: usize = 13;
 const ID_RING_TEXT: usize = 14;
 const ID_ROLL: usize = 15;
+const ID_HIDE_FIVE: usize = 16;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -103,6 +104,7 @@ struct RenderKey {
     rings: bool,
     ring_text: bool,
     hide_labels: bool,
+    hide_five: bool,
     rows_per_col: u32,
 }
 
@@ -165,6 +167,8 @@ struct State {
     ring_text: bool,
     /// Roll the digits when a number changes.
     roll: bool,
+    /// Leave out the 5-hour group even when the account has that limit.
+    hide_five: bool,
     /// Accounts stacked in each column of the widget.
     rows_per_col: u32,
     /// claude-swap's `cswap.exe`, found once at launch.
@@ -183,7 +187,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, hide_five: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -265,6 +269,7 @@ fn main() {
             s.rings = read_setting("Rings") == Some(1);
             s.ring_text = read_setting("RingText") == Some(1);
             s.roll = read_setting("RollNumbers") == Some(1);
+            s.hide_five = read_setting("HideFiveHour") == Some(1);
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -432,6 +437,10 @@ fn ensure_widget() {
                     }
                 })
                 .collect();
+            // Plans without a 5-hour limit (Ultra) report none: hide the group
+            // on its own once every loaded account says so.
+            let mut loaded = s.accounts.iter().filter_map(|a| a.usage).peekable();
+            let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| u.five_hour.is_none()));
             let key = RenderKey {
                 h,
                 dpi,
@@ -451,6 +460,7 @@ fn ensure_widget() {
                 rings: s.rings,
                 ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
+                hide_five,
                 rows_per_col: s.rows_per_col,
             };
             let model = render::Model {
@@ -464,6 +474,7 @@ fn ensure_widget() {
                 rings: s.rings,
                 ring_text: s.ring_text,
                 hide_labels: s.hide_labels,
+                hide_five,
                 rows_per_col: s.rows_per_col as usize,
             };
             let changed = s.rendered.as_ref() != Some(&key);
@@ -596,7 +607,9 @@ fn tooltip_text(s: &State) -> String {
         }
         let u = a.usage.unwrap_or_default();
         if a.usage.is_some() {
-            out += &line("5-hour", u.five_hour, false);
+            if u.five_hour.is_some() {
+                out += &line("5-hour", u.five_hour, false);
+            }
             out += &line("Weekly", u.weekly, true);
             if u.fable.is_some() {
                 out += &line("Fable (weekly)", u.fable, true);
@@ -1118,6 +1131,7 @@ unsafe fn show_menu() {
     AppendMenuW(custom, check(ring_text) | if rings { 0 } else { MF_GRAYED }, ID_RING_TEXT, w!("Numbers inside the rings"));
     AppendMenuW(custom, check(with(|s| s.roll)), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, check(hide_labels), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
+    AppendMenuW(custom, check(with(|s| s.hide_five)), ID_HIDE_FIVE, w!("Hide 5-hour usage"));
     AppendMenuW(custom, check(with(|s| s.on_left)), ID_ON_LEFT, w!("Show on the left side"));
     // Only matters with more than one account.
     let (per_col, n_accounts) = with(|s| (s.rows_per_col, s.accounts.len()));
@@ -1216,6 +1230,14 @@ unsafe fn show_menu() {
                 s.roll
             });
             write_setting("RollNumbers", on as u32);
+        }
+        ID_HIDE_FIVE => {
+            let on = with(|s| {
+                s.hide_five = !s.hide_five;
+                s.hide_five
+            });
+            write_setting("HideFiveHour", on as u32);
+            ensure_widget();
         }
         ID_PIXEL_ICON => {
             let on = with(|s| {
