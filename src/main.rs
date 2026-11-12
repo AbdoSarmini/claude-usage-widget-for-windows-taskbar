@@ -56,6 +56,7 @@ const ID_ROLL: usize = 15;
 const ID_HIDE_FIVE: usize = 16;
 const ID_HIDE_WEEK: usize = 17;
 const ID_HIDE_FABLE: usize = 18;
+const ID_CLAUDE_ICON: usize = 19;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -1137,8 +1138,12 @@ unsafe fn show_menu() {
         AppendMenuW(fonts, check(*px == font_size), ID_FONT_BASE + i, wide(label).as_ptr());
     }
     AppendMenuW(custom, MF_POPUP, fonts as usize, w!("Font size"));
-    AppendMenuW(custom, check(hide_icon), ID_HIDE_ICON, w!("Hide Claude icon"));
-    AppendMenuW(custom, check(with(|s| s.pixel_icon)), ID_PIXEL_ICON, w!("Pixel Claude icon"));
+    let icon = CreatePopupMenu();
+    let pixel = with(|s| s.pixel_icon);
+    AppendMenuW(icon, check(hide_icon), ID_HIDE_ICON, w!("Hide icon"));
+    AppendMenuW(icon, check(!hide_icon && !pixel), ID_CLAUDE_ICON, w!("Show Claude icon"));
+    AppendMenuW(icon, check(!hide_icon && pixel), ID_PIXEL_ICON, w!("Show pixel Claude icon"));
+    AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
     let (rings, ring_text) = with(|s| (s.rings, s.ring_text));
     AppendMenuW(custom, check(rings), ID_RINGS, w!("Show usage rings"));
     AppendMenuW(custom, check(ring_text) | if rings { 0 } else { MF_GRAYED }, ID_RING_TEXT, w!("Numbers inside the rings"));
@@ -1274,14 +1279,6 @@ unsafe fn show_menu() {
             write_setting("HideFable", on as u32);
             ensure_widget();
         }
-        ID_PIXEL_ICON => {
-            let on = with(|s| {
-                s.pixel_icon = !s.pixel_icon;
-                s.pixel_icon
-            });
-            write_setting("PixelIcon", on as u32);
-            ensure_widget();
-        }
         ID_ON_LEFT => {
             let on = with(|s| {
                 s.on_left = !s.on_left;
@@ -1298,12 +1295,19 @@ unsafe fn show_menu() {
             write_setting("HideLabels", on as u32);
             ensure_widget();
         }
-        ID_HIDE_ICON => {
-            let on = with(|s| {
-                s.hide_icon = !s.hide_icon;
-                s.hide_icon
+        id @ (ID_HIDE_ICON | ID_CLAUDE_ICON | ID_PIXEL_ICON) => {
+            let (hide, pixel) = (id == ID_HIDE_ICON, id == ID_PIXEL_ICON);
+            with(|s| {
+                s.hide_icon = hide;
+                // Hiding keeps the chosen mark for when it is shown again.
+                if !hide {
+                    s.pixel_icon = pixel;
+                }
             });
-            write_setting("HideIcon", on as u32);
+            write_setting("HideIcon", hide as u32);
+            if !hide {
+                write_setting("PixelIcon", pixel as u32);
+            }
             ensure_widget();
         }
         id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
