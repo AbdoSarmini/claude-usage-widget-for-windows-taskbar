@@ -1143,7 +1143,7 @@ unsafe fn show_menu() {
     AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
     AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
     AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
-    AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide 5h / W labels"));
+    AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
     let limits = CreatePopupMenu();
     AppendMenuW(limits, tick(ID_HIDE_FIVE), ID_HIDE_FIVE, w!("5-hour"));
     AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));

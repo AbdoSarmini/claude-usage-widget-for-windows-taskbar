@@ -55,7 +55,7 @@ One small file (~450 KB). No installer, no runtime, nothing else to download.
 | Right-click → **Show remaining instead of used** | Shows `75%` left instead of `25%` used |
 | Right-click → **Customize → Font size** | Six text sizes, from Smallest to Largest |
 | Right-click → **Customize → Icon** | Choose **Hide icon** (numbers only), **Show Claude icon** or **Show pixel Claude icon** |
-| Right-click → **Customize → Hide 5h / W labels** | Shows only the percentages (5-hour first, then weekly), making the widget narrower |
+| Right-click → **Customize → Hide labels** | Leaves out the `5h` / `W` / `F` labels and shows only the percentages, making the widget narrower |
 | Right-click → **Customize → Show/hide limits** | Turns the 5-hour, weekly and Fable numbers on or off. The 5-hour group also hides on its own for accounts without a 5-hour limit (Ultra), and the Fable group for accounts without a Fable limit |
 | Right-click → **Customize → Show usage rings** | Adds a progress ring next to each number |
 | Right-click → **Customize → Numbers inside the rings** | Larger rings with the percentage inside (needs rings on) |
@@ -116,7 +116,7 @@ Settings are stored in `HKEY_CURRENT_USER\Software\ClaudeUsageWidget`. You can d
 |---|---|
 | Numbers are dimmed, tooltip says to sign in | Run `claude` in a terminal and sign in again. |
 | `–` instead of numbers | No usage data yet: check your internet connection, or hover for the error. |
-| Widget overlaps taskbar app icons | This happens with many apps pinned, left-aligned taskbar icons, or several accounts side by side. The widget always sits left of the tray icons and grows to the left. To make it narrower, use **Customize → Hide 5h / W labels**, **Icon → Hide icon**, a smaller **Font size**, or more **Accounts per column**. |
+| Widget overlaps taskbar app icons | This happens with many apps pinned, left-aligned taskbar icons, or several accounts side by side. The widget always sits left of the tray icons and grows to the left. To make it narrower, use **Customize → Hide labels**, **Icon → Hide icon**, a smaller **Font size**, or more **Accounts per column**. |
 | Widget doesn't appear on my second monitor | Only the main taskbar is supported. |
 
 ## Privacy
