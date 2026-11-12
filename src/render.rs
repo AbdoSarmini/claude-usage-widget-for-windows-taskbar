@@ -289,6 +289,8 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                     if !m.hide_labels {
                         segs.push(Seg { text: labels[g].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
                     }
+                    let dy = y0 + ((y1 - y0) - div_h) / 2;
+                    dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
                     let content_x = group_x[g] + label_w[g] + gap_lv;
                     let color = value_color(val, &pal);
                     if m.rings {
@@ -351,8 +353,6 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                             });
                         }
                     }
-                    let dy = y0 + ((y1 - y0) - div_h) / 2;
-                    dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
                 }
             }
             if ci + 1 < columns.len() {
