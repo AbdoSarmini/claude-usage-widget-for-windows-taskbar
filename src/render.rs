@@ -88,8 +88,10 @@ pub struct Model {
     pub ring_text: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
-    /// Leave out the 5-hour group (plans without that limit).
+    /// Leave out the 5-hour, weekly or Fable group.
     pub hide_five: bool,
+    pub hide_week: bool,
+    pub hide_fable: bool,
     /// Accounts stacked per column (1 to MAX_ROWS_PER_COLUMN); more start a new column.
     pub rows_per_col: usize,
 }
@@ -250,7 +252,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
             // Line the column's rows up: each field is as wide as its widest value.
             let labels = [enc("5h"), enc("W"), enc("F")];
             // Which of 5h / week / Fable are shown, as indexes into `labels`.
-            let ids: Vec<usize> = [!m.hide_five, true, rows.iter().any(|r| r.fable.is_some())]
+            let ids: Vec<usize> = [!m.hide_five, !m.hide_week, !m.hide_fable && rows.iter().any(|r| r.fable.is_some())]
                 .iter()
                 .enumerate()
                 .filter_map(|(k, on)| on.then_some(k))
