@@ -88,6 +88,8 @@ pub struct Model {
     pub rings: bool,
     /// With rings: put the number inside a larger ring instead of beside a small one.
     pub ring_text: bool,
+    /// With rings: only the ring turns orange / red near the limit, the number keeps its color.
+    pub ring_color_only: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
     /// Leave out the 5-hour, weekly or Fable group.
@@ -249,6 +251,19 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut sz);
             sz.cx
         };
+        // Blank space before the first glyph and after the last one.
+        let bearings = |t: &[u16], f: HFONT| -> (i32, i32) {
+            SelectObject(dc, f);
+            let abc = |c: u16| {
+                let mut a = std::mem::zeroed::<ABC>();
+                GetCharABCWidthsW(dc, c as u32, c as u32, &mut a);
+                a
+            };
+            match (t.first(), t.last()) {
+                (Some(&a), Some(&b)) => (abc(a).abcA, abc(b).abcC),
+                _ => (0, 0),
+            }
+        };
         if inside {
             // The widest number, "100%", keeps clear of the ring's inner edge.
             let room = ring_d as f32 * 0.8 - 2.0 * (ring_d as f32 * 0.1).max(1.5);
@@ -373,15 +388,22 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                         });
                     }
                     let vf = if inside { f_small } else { f_value };
-                    let text_x = |tw: i32| if inside { content_x + (ring_d - tw) / 2 } else { content_x + ring_d + ring_gap };
-                    let color = dim(row.stale, color);
+                    let text_x = |t: &[u16]| {
+                        if inside {
+                            let (a, c) = bearings(t, vf);
+                            content_x + (ring_d - (measure(t, vf) - a - c)) / 2 - a
+                        } else {
+                            content_x + ring_d + ring_gap
+                        }
+                    };
+                    let color = dim(row.stale, if m.rings && m.ring_color_only { pal.value } else { color });
                     let old = row
                         .roll
                         .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left)))
                         .filter(|o| *o != vals[g]);
                     let Some(old) = old else {
                         let vw = measure(&vals[g], vf);
-                        segs.push(Seg { text: vals[g].clone(), bold: true, small: inside, x: text_x(vw), w: vw, y0, y1, color, blur: 0, slack: s(2.0) });
+                        segs.push(Seg { text: vals[g].clone(), bold: true, small: inside, x: text_x(&vals[g]), w: vw, y0, y1, color, blur: 0, slack: s(2.0) });
                         continue;
                     };
                     // Rolling: each changed character's old glyph leaves upward while the new
@@ -392,7 +414,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     let moved = (p * line as f32).round() as i32;
                     let blur = (speed * line as f32 * 0.048).round() as i32;
                     for (text, other, is_new) in [(&old, &vals[g], false), (&vals[g], &old, true)] {
-                        let base = text_x(measure(text, vf));
+                        let base = text_x(text);
                         for i in 0..text.len() {
                             let changed = other.get(i) != Some(&text[i]);
                             if !changed && !is_new {
