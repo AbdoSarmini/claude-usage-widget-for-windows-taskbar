@@ -17,7 +17,7 @@ One small file (~450 KB). No installer, nothing else to download.
 
 - Always visible in the taskbar, not hidden in the tray.
 - Tiny: about 5 MB of memory and near-zero CPU.
-- Turns orange at 80% and red at 95%.
+- Turns orange above 75% and red above 95%, like Claude Code.
 - Hover for reset times and details.
 - Follows your light or dark Windows theme.
 - Multiple Claude Code accounts at once.

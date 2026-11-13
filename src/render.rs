@@ -118,8 +118,9 @@ fn value_text(v: Option<f64>, show_left: bool) -> String {
 
 fn value_color(v: Option<f64>, pal: &Palette) -> Rgba {
     match v {
-        Some(p) if p >= 95.0 => pal.crit,
-        Some(p) if p >= 80.0 => pal.warn,
+        // Claude Code's thresholds: warning above 75 %, critical above 95 %.
+        Some(p) if p > 95.0 => pal.crit,
+        Some(p) if p > 75.0 => pal.warn,
         _ => pal.value,
     }
 }
@@ -236,7 +237,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         // Ring diameter: big enough for the number inside, or about text height beside it.
         let ring_d = if !m.rings { 0 } else { (row_h as i32 - s(2.0)).clamp(1, s(if inside { 34.0 } else { 16.0 })) };
         let ring_gap = if m.rings && !inside { s(5.0) } else { 0 };
-        let mut small_px = ((ring_d as f32 * 0.28).round() as i32).max(1);
+        let mut small_px = ((ring_d as f32 * 0.32).round() as i32).max(1);
         let mut f_small = make_font(
             small_px,
             &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"],
@@ -266,7 +267,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         };
         if inside {
             // The widest number, "100%", keeps clear of the ring's inner edge.
-            let room = ring_d as f32 * 0.8 - 2.0 * (ring_d as f32 * 0.1).max(1.5);
+            let room = ring_d as f32 * 0.85 - 2.0 * (ring_d as f32 * 0.1).max(1.5);
             let widest = measure(&"100%".encode_utf16().collect::<Vec<u16>>(), f_small) as f32;
             if widest > room {
                 small_px = ((small_px as f32 * room / widest).floor() as i32).max(1);
