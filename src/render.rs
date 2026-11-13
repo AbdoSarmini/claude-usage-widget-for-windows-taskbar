@@ -94,6 +94,8 @@ pub struct Model {
     pub ring_space: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
+    /// Show `42` instead of `42%`.
+    pub hide_percent: bool,
     /// Leave out the 5-hour, weekly or Fable group.
     pub hide_five: bool,
     pub hide_week: bool,
@@ -108,11 +110,12 @@ pub struct Frame {
     pub px: Vec<[u8; 4]>, // premultiplied B, G, R, A
 }
 
-fn value_text(v: Option<f64>, show_left: bool) -> String {
+fn value_text(v: Option<f64>, show_left: bool, hide_percent: bool) -> String {
     match v {
         Some(p) => {
             let used = p.round().clamp(0.0, 100.0) as i64;
-            format!("{}%", if show_left { 100 - used } else { used })
+            let n = if show_left { 100 - used } else { used };
+            if hide_percent { n.to_string() } else { format!("{n}%") }
         }
         None => "–".into(),
     }
@@ -271,9 +274,9 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             }
         };
         if inside {
-            // The widest number, "100%", keeps clear of the ring's inner edge.
+            // The widest number, "100%" (or "100"), keeps clear of the ring's inner edge.
             let room = ring_d as f32 * 0.85 - 2.0 * (ring_d as f32 * 0.1).max(1.5);
-            let widest = measure(&"100%".encode_utf16().collect::<Vec<u16>>(), f_small) as f32;
+            let widest = measure(&(if m.hide_percent { "100" } else { "100%" }).encode_utf16().collect::<Vec<u16>>(), f_small) as f32;
             if widest > room {
                 small_px = ((small_px as f32 * room / widest).floor() as i32).max(1);
                 DeleteObject(f_small);
@@ -324,7 +327,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 .collect();
             let values: Vec<Vec<Vec<u16>>> = col
                 .iter()
-                .map(|r| ids.iter().map(|&k| enc(&value_text([r.five, r.week, r.fable][k], m.show_left))).collect())
+                .map(|r| ids.iter().map(|&k| enc(&value_text([r.five, r.week, r.fable][k], m.show_left, m.hide_percent))).collect())
                 .collect();
             let mut value_w = vec![0; groups];
             for v in &values {
@@ -405,7 +408,7 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                     let color = dim(row.stale, if m.rings && m.ring_color_only { pal.value } else { color });
                     let old = row
                         .roll
-                        .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left)))
+                        .map(|(from, _)| enc(&value_text(from[ids[g]], m.show_left, m.hide_percent)))
                         .filter(|o| *o != vals[g]);
                     let Some(old) = old else {
                         let vw = measure(&vals[g], vf);
