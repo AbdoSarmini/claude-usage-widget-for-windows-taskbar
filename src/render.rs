@@ -235,7 +235,11 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         }
         let inside = m.rings && m.ring_text;
         // Ring diameter: big enough for the number inside, or about text height beside it.
-        let ring_d = if !m.rings { 0 } else { (row_h as i32 - s(2.0)).clamp(1, s(if inside { 34.0 } else { 16.0 })) };
+        // A ring with the number inside keeps space above and below it (14 % of the
+        // row each side) instead of reaching the taskbar's edges; vertical lines
+        // have their own spacing.
+        let fill = if inside && !vertical { (row_h * 0.72).round() as i32 } else { row_h as i32 - s(2.0) };
+        let ring_d = if !m.rings { 0 } else { fill.clamp(1, s(if inside { 34.0 } else { 16.0 })) };
         let ring_gap = if m.rings && !inside { s(5.0) } else { 0 };
         let mut small_px = ((ring_d as f32 * 0.32).round() as i32).max(1);
         let mut f_small = make_font(
