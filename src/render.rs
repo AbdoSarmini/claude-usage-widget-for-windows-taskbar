@@ -129,7 +129,7 @@ unsafe fn make_font(px: i32, faces: &[&str]) -> HFONT {
         let f = CreateFontW(
             -px, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0,
             DEFAULT_CHARSET as u32, OUT_TT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
-            ANTIALIASED_QUALITY as u32, (DEFAULT_PITCH | FF_SWISS) as u32,
+            DEFAULT_QUALITY as u32, (DEFAULT_PITCH | FF_SWISS) as u32,
             wide(face).as_ptr(),
         );
         if i + 1 == faces.len() || font_is(f, face) {
@@ -486,9 +486,20 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         }
         GdiFlush();
         let n = (w * h) as usize;
-        let mask: Vec<u8> = std::slice::from_raw_parts(bits as *const [u8; 4], n)
+        // ClearType coverage per subpixel, as R, G, B (the DIB is BGRA). On a light
+        // taskbar it is averaged to gray: one alpha can't carry per-channel coverage,
+        // and the error that leaves (bg x coverage difference) shows on light
+        // backgrounds only.
+        let mask: Vec<[u8; 3]> = std::slice::from_raw_parts(bits as *const [u8; 4], n)
             .iter()
-            .map(|p| p[0].max(p[1]).max(p[2]))
+            .map(|p| {
+                if m.dark {
+                    [p[2], p[1], p[0]]
+                } else {
+                    let g = ((p[0] as u32 + p[1] as u32 + p[2] as u32) / 3) as u8;
+                    [g, g, g]
+                }
+            })
             .collect();
         SelectObject(dc, old_bmp);
         DeleteObject(bmp);
@@ -577,13 +588,23 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
                 for xx in seg.x.max(0)..(seg.x + seg.w + seg.slack).min(w) {
                     let i = (y * w + xx) as usize;
                     // Motion blur: a vertical box average kept inside the glyph's own line box.
-                    let sum: u32 = (y - seg.blur..=y + seg.blur)
-                        .filter(|yy| (seg.y0.max(0)..seg.y1.min(h)).contains(yy))
-                        .map(|yy| mask[(yy * w + xx) as usize] as u32)
-                        .sum();
-                    let cov = sum as f32 / (255.0 * (2 * seg.blur + 1) as f32);
-                    if cov > 0.0 {
-                        over(&mut buf, i, seg.color, cov);
+                    let mut sum = [0u32; 3];
+                    for yy in (y - seg.blur..=y + seg.blur).filter(|yy| (seg.y0.max(0)..seg.y1.min(h)).contains(yy)) {
+                        let mk = mask[(yy * w + xx) as usize];
+                        (0..3).for_each(|c| sum[c] += mk[c] as u32);
+                    }
+                    let cov = sum.map(|v| v as f32 / (255.0 * (2 * seg.blur + 1) as f32));
+                    if cov.iter().any(|&c| c > 0.0) {
+                        // Per-channel "over" in premultiplied BGRA; alpha takes the
+                        // strongest channel.
+                        let c = seg.color;
+                        let a = cov.map(|v| c.3 * v);
+                        let d = &mut buf[i];
+                        d[0] = c.2 * a[2] + d[0] * (1.0 - a[2]);
+                        d[1] = c.1 * a[1] + d[1] * (1.0 - a[1]);
+                        d[2] = c.0 * a[0] + d[2] * (1.0 - a[0]);
+                        let am = a[0].max(a[1]).max(a[2]);
+                        d[3] = am + d[3] * (1.0 - am);
                     }
                 }
             }
