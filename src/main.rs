@@ -58,6 +58,7 @@ const ID_HIDE_WEEK: usize = 17;
 const ID_HIDE_FABLE: usize = 18;
 const ID_CLAUDE_ICON: usize = 19;
 const ID_RING_COLOR_ONLY: usize = 20;
+const ID_RING_SPACE: usize = 21;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -114,6 +115,7 @@ struct RenderKey {
     rings: bool,
     ring_text: bool,
     ring_color_only: bool,
+    ring_space: bool,
     hide_labels: bool,
     hide_five: bool,
     hide_week: bool,
@@ -180,6 +182,7 @@ struct State {
     rings: bool,
     ring_text: bool,
     ring_color_only: bool,
+    ring_space: bool,
     /// Roll the digits when a number changes.
     roll: bool,
     /// Limits turned off in "Show/hide limits". The 5-hour and Fable groups
@@ -205,7 +208,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -290,6 +293,7 @@ fn main() {
             s.rings = read_setting("Rings") == Some(1);
             s.ring_text = read_setting("RingText") == Some(1);
             s.ring_color_only = read_setting("RingColorOnly") == Some(1);
+            s.ring_space = read_setting("RingSpace") == Some(1);
             s.roll = read_setting("RollNumbers") == Some(1);
             s.hide_five = read_setting("HideFiveHour") == Some(1);
             s.hide_week = read_setting("HideWeekly") == Some(1);
@@ -490,6 +494,7 @@ fn ensure_widget() {
                 rings: s.rings,
                 ring_text: s.ring_text,
                 ring_color_only: s.ring_color_only,
+                ring_space: s.ring_space,
                 hide_labels: s.hide_labels,
                 hide_five,
                 hide_week: s.hide_week,
@@ -508,6 +513,7 @@ fn ensure_widget() {
                 rings: s.rings,
                 ring_text: s.ring_text,
                 ring_color_only: s.ring_color_only,
+                ring_space: s.ring_space,
                 hide_labels: s.hide_labels,
                 hide_five,
                 hide_week: s.hide_week,
@@ -1180,6 +1186,7 @@ unsafe fn show_menu() {
     AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
     AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
     AppendMenuW(custom, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
+    AppendMenuW(custom, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
     AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
     let limits = CreatePopupMenu();
@@ -1292,6 +1299,7 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_RINGS => s.rings,
             ID_RING_TEXT => s.ring_text,
             ID_RING_COLOR_ONLY => s.ring_color_only,
+            ID_RING_SPACE => s.ring_space,
             ID_ROLL => s.roll,
             ID_HIDE_LABELS => s.hide_labels,
             ID_ON_LEFT => s.on_left,
@@ -1337,6 +1345,14 @@ fn apply_setting(id: usize) -> bool {
                 s.rings
             });
             write_setting("Rings", on as u32);
+            ensure_widget();
+        }
+        ID_RING_SPACE => {
+            let on = with(|s| {
+                s.ring_space = !s.ring_space;
+                s.ring_space
+            });
+            write_setting("RingSpace", on as u32);
             ensure_widget();
         }
         ID_RING_COLOR_ONLY => {
@@ -1456,8 +1472,9 @@ unsafe fn refresh_menu(menu: HMENU) {
         if let Some(on) = setting_checked(id) {
             CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
         }
-        if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY {
-            let on = with(|s| s.rings);
+        if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY || id == ID_RING_SPACE {
+            // Space around the rings only applies with the numbers inside them.
+            let on = with(|s| s.rings && (id != ID_RING_SPACE || s.ring_text));
             EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
         }
     }

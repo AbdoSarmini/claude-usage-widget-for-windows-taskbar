@@ -90,6 +90,8 @@ pub struct Model {
     pub ring_text: bool,
     /// With rings: only the ring turns orange / red near the limit, the number keeps its color.
     pub ring_color_only: bool,
+    /// With numbers inside: smaller rings that keep space above and below (small taskbars).
+    pub ring_space: bool,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
     /// Leave out the 5-hour, weekly or Fable group.
@@ -235,10 +237,9 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
         }
         let inside = m.rings && m.ring_text;
         // Ring diameter: big enough for the number inside, or about text height beside it.
-        // A ring with the number inside keeps space above and below it (14 % of the
-        // row each side) instead of reaching the taskbar's edges; vertical lines
-        // have their own spacing.
-        let fill = if inside && !vertical { (row_h * 0.72).round() as i32 } else { row_h as i32 - s(2.0) };
+        // "Space around the rings": 14 % of the row free above and below instead of
+        // reaching the taskbar's edges (vertical lines have their own spacing).
+        let fill = if inside && m.ring_space && !vertical { (row_h * 0.72).round() as i32 } else { row_h as i32 - s(2.0) };
         let ring_d = if !m.rings { 0 } else { fill.clamp(1, s(if inside { 34.0 } else { 16.0 })) };
         let ring_gap = if m.rings && !inside { s(5.0) } else { 0 };
         let mut small_px = ((ring_d as f32 * 0.32).round() as i32).max(1);
