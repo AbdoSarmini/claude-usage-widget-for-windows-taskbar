@@ -92,6 +92,8 @@ pub struct Model {
     pub ring_color_only: bool,
     /// With numbers inside: smaller rings that keep space above and below (small taskbars).
     pub ring_space: bool,
+    /// With numbers inside: gap in pixels (at 100% scaling) between the number and the ring.
+    pub ring_margin: u32,
     /// Leave out the `5h` / `W` labels, showing only the numbers.
     pub hide_labels: bool,
     /// Show `42` instead of `42%`.
@@ -274,10 +276,11 @@ fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
             }
         };
         if inside {
-            // The widest number, "100%" (or "100"), keeps clear of the ring's inner edge.
-            let room = ring_d as f32 * 0.85 - 2.0 * (ring_d as f32 * 0.1).max(1.5);
+            // The widest number, "100%" (or "100"), fills the ring's inner width minus
+            // the margin, growing or shrinking the text as needed.
+            let room = (ring_d as f32 - 2.0 * (ring_d as f32 * 0.1).max(1.5) - 2.0 * s(m.ring_margin as f32) as f32).max(1.0);
             let widest = measure(&(if m.hide_percent { "100" } else { "100%" }).encode_utf16().collect::<Vec<u16>>(), f_small) as f32;
-            if widest > room {
+            if widest > 0.0 && (widest - room).abs() >= 0.5 {
                 small_px = ((small_px as f32 * room / widest).floor() as i32).max(1);
                 DeleteObject(f_small);
                 f_small = make_font(small_px, &["Segoe UI Variable Text Semibold", "Segoe UI Semibold"]);

@@ -61,6 +61,10 @@ const ID_RING_COLOR_ONLY: usize = 20;
 const ID_RING_SPACE: usize = 21;
 const ID_HIDE_PERCENT: usize = 22;
 const ID_FAKE_DATA: usize = 23;
+const ID_RING_MARGIN_BASE: usize = 600; // + index into RING_MARGINS
+/// Gap between a ring's number and the ring (pixels at 100% scaling).
+const RING_MARGINS: [u32; 7] = [0, 1, 2, 3, 4, 5, 6];
+const DEFAULT_RING_MARGIN: u32 = 2;
 /// Dev-only options exist in debug builds and with `--features dev`.
 const DEV: bool = cfg!(any(debug_assertions, feature = "dev"));
 /// Fake data changes this often.
@@ -122,6 +126,7 @@ struct RenderKey {
     ring_text: bool,
     ring_color_only: bool,
     ring_space: bool,
+    ring_margin: u32,
     hide_labels: bool,
     hide_percent: bool,
     hide_five: bool,
@@ -191,6 +196,7 @@ struct State {
     ring_text: bool,
     ring_color_only: bool,
     ring_space: bool,
+    ring_margin: u32,
     /// Roll the digits when a number changes.
     roll: bool,
     /// Limits turned off in "Show/hide limits". The 5-hour and Fable groups
@@ -220,7 +226,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, ring_margin: DEFAULT_RING_MARGIN, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         fake_data: false, menu_tip: null_mut(),
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
@@ -308,6 +314,9 @@ fn main() {
             s.ring_text = read_setting("RingText") == Some(1);
             s.ring_color_only = read_setting("RingColorOnly") == Some(1);
             s.ring_space = read_setting("RingSpace") == Some(1);
+            s.ring_margin = read_setting("RingMargin")
+                .filter(|m| RING_MARGINS.contains(m))
+                .unwrap_or(DEFAULT_RING_MARGIN);
             s.roll = read_setting("RollNumbers") == Some(1);
             s.hide_five = read_setting("HideFiveHour") == Some(1);
             s.hide_week = read_setting("HideWeekly") == Some(1);
@@ -511,6 +520,7 @@ fn ensure_widget() {
                 ring_text: s.ring_text,
                 ring_color_only: s.ring_color_only,
                 ring_space: s.ring_space,
+                ring_margin: s.ring_margin,
                 hide_labels: s.hide_labels,
                 hide_percent: s.hide_percent,
                 hide_five,
@@ -531,6 +541,7 @@ fn ensure_widget() {
                 ring_text: s.ring_text,
                 ring_color_only: s.ring_color_only,
                 ring_space: s.ring_space,
+                ring_margin: s.ring_margin,
                 hide_labels: s.hide_labels,
                 hide_percent: s.hide_percent,
                 hide_five,
@@ -1309,6 +1320,12 @@ unsafe fn show_menu() {
     AppendMenuW(rings, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
     AppendMenuW(rings, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
     AppendMenuW(rings, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
+    let margins = CreatePopupMenu();
+    for (i, px) in RING_MARGINS.iter().enumerate() {
+        let text = wide(&format!("{px} px"));
+        AppendMenuW(margins, tick(ID_RING_MARGIN_BASE + i), ID_RING_MARGIN_BASE + i, text.as_ptr());
+    }
+    AppendMenuW(rings, MF_POPUP, margins as usize, w!("Number margin"));
     AppendMenuW(custom, MF_POPUP, rings as usize, w!("Usage rings"));
     AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
@@ -1445,6 +1462,9 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_PIXEL_ICON => !s.hide_icon && s.pixel_icon,
             id if (ID_PER_COL_BASE + 1..=ID_PER_COL_BASE + render::MAX_ROWS_PER_COLUMN).contains(&id) => {
                 s.rows_per_col as usize == id - ID_PER_COL_BASE
+            }
+            id if (ID_RING_MARGIN_BASE..ID_RING_MARGIN_BASE + RING_MARGINS.len()).contains(&id) => {
+                s.ring_margin == RING_MARGINS[id - ID_RING_MARGIN_BASE]
             }
             id if (ID_FONT_BASE..ID_FONT_BASE + FONT_SIZES.len()).contains(&id) => {
                 s.font_size == FONT_SIZES[id - ID_FONT_BASE].0
@@ -1590,6 +1610,12 @@ fn apply_setting(id: usize) -> bool {
             ensure_widget();
             update_tooltip();
         }
+        id if (ID_RING_MARGIN_BASE..ID_RING_MARGIN_BASE + RING_MARGINS.len()).contains(&id) => {
+            let px = RING_MARGINS[id - ID_RING_MARGIN_BASE];
+            with(|s| s.ring_margin = px);
+            write_setting("RingMargin", px);
+            ensure_widget();
+        }
         id if (ID_ICON_SIZE_BASE..ID_ICON_SIZE_BASE + ICON_SIZES.len()).contains(&id) => {
             let px = ICON_SIZES[id - ID_ICON_SIZE_BASE].0;
             with(|s| s.icon_size = px);
@@ -1624,6 +1650,10 @@ unsafe fn refresh_menu(menu: HMENU) {
             if id == ID_FAKE_DATA {
                 set_menu_dot(menu, id, on);
             }
+        }
+        if (ID_RING_MARGIN_BASE..ID_RING_MARGIN_BASE + RING_MARGINS.len()).contains(&id) {
+            let on = with(|s| s.rings && s.ring_text);
+            EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
         }
         if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY || id == ID_RING_SPACE {
             // Space around the rings only applies with the numbers inside them.
