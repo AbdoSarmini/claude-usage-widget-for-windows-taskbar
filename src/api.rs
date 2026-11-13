@@ -253,6 +253,37 @@ fn get_usage(token: &str) -> Result<http::Response, FetchError> {
 }
 
 /// Fetches usage for the Claude Code login stored in `dir`.
+/// Random usage for the dev-only "fake data" mode, so development does not
+/// hit the real API's rate limits.
+pub fn fake_usage() -> Usage {
+    use std::cell::Cell;
+    thread_local! { static SEED: Cell<u64> = const { Cell::new(0) }; }
+    let next = move || {
+        SEED.with(|s| {
+            let mut x = s.get();
+            if x == 0 {
+                x = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64 | 1;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            s.set(x);
+            x
+        })
+    };
+    let now = now_ms() / 1000;
+    let limit = |window_secs: u64| {
+        let percent = (next() % 1001) as f64 / 10.0;
+        Limit { percent, resets_at: Some(now + (next() % window_secs) as i64 + 60) }
+    };
+    Usage {
+        five_hour: Some(limit(5 * 3600)),
+        has_five_hour: true,
+        weekly: Some(limit(7 * 86400)),
+        fable: Some(limit(7 * 86400)),
+    }
+}
+
 pub fn fetch(dir: &Path) -> Result<Usage, FetchError> {
     let c = load_creds(dir)?;
     let mut token = if needs_refresh(&c) { refresh(dir, None)? } else { c.access };

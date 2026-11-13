@@ -60,6 +60,11 @@ const ID_CLAUDE_ICON: usize = 19;
 const ID_RING_COLOR_ONLY: usize = 20;
 const ID_RING_SPACE: usize = 21;
 const ID_HIDE_PERCENT: usize = 22;
+const ID_FAKE_DATA: usize = 23;
+/// Dev-only options exist in debug builds and with `--features dev`.
+const DEV: bool = cfg!(any(debug_assertions, feature = "dev"));
+/// Fake data changes this often.
+const FAKE_DATA_SECS: u32 = 15;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -195,6 +200,10 @@ struct State {
     hide_fable: bool,
     /// Accounts stacked in each column of the widget.
     rows_per_col: u32,
+    /// Dev only: random usage instead of the API.
+    fake_data: bool,
+    /// Dev only: the tooltip shown while hovering a menu item.
+    menu_tip: HWND,
     /// claude-swap's `cswap.exe`, found once at launch.
     cswap: Option<PathBuf>,
     /// A `cswap switch` is running.
@@ -212,6 +221,7 @@ thread_local! {
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
         font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        fake_data: false, menu_tip: null_mut(),
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -302,6 +312,7 @@ fn main() {
             s.hide_five = read_setting("HideFiveHour") == Some(1);
             s.hide_week = read_setting("HideWeekly") == Some(1);
             s.hide_fable = read_setting("HideFable") == Some(1);
+            s.fake_data = DEV && read_setting("FakeData") == Some(1);
             s.cswap = find_cswap();
             s.rows_per_col = read_setting("AccountsPerColumn")
                 .filter(|v| (1..=render::MAX_ROWS_PER_COLUMN as u32).contains(v))
@@ -335,12 +346,12 @@ fn start_fetch(id: u32) {
             return None;
         }
         a.fetching = true;
-        Some((s.ctl as isize, a.dir.clone()))
+        Some((s.ctl as isize, a.dir.clone(), s.fake_data))
     });
-    let Some((ctl, dir)) = job else { return };
+    let Some((ctl, dir, fake)) = job else { return };
     unsafe { KillTimer(ctl as HWND, T_FETCH_BASE + id as usize) };
     std::thread::spawn(move || {
-        let r = api::fetch(&dir);
+        let r = if fake { Ok(api::fake_usage()) } else { api::fetch(&dir) };
         let label = api::account_label(&dir);
         let msg = Box::new(FetchResult { id, label, r });
         unsafe { PostMessageW(ctl as HWND, WM_APP_RESULT, 0, Box::into_raw(msg) as LPARAM) };
@@ -382,7 +393,8 @@ fn on_result(res: FetchResult) {
         } else {
             a.rate_limited = 0;
         }
-        Some((s.ctl, backoff_secs(interval, a.rate_limited)))
+        let wait = if s.fake_data { FAKE_DATA_SECS } else { backoff_secs(interval, a.rate_limited) };
+        Some((s.ctl, wait))
     });
     if let Some((ctl, secs)) = next {
         unsafe {
@@ -1160,6 +1172,108 @@ fn open_url(url: &str) {
     }
 }
 
+/// A small yellow dot next to the item (a native menu can show an icon but not a coloured label).
+/// Bright when the option is on, faint when off. Both bitmaps are made once.
+unsafe fn set_menu_dot(menu: HMENU, id: usize, on: bool) {
+    thread_local! { static DOTS: Cell<[HBITMAP; 2]> = const { Cell::new([null_mut(); 2]) }; }
+    let mut dots = DOTS.with(|d| d.get());
+    if dots[on as usize].is_null() {
+        dots[on as usize] = make_dot(if on { 1.0 } else { 0.35 });
+        DOTS.with(|d| d.set(dots));
+    }
+    let bmp = dots[on as usize];
+    if bmp.is_null() {
+        return;
+    }
+    let mii = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_BITMAP,
+        hbmpItem: bmp,
+        ..std::mem::zeroed()
+    };
+    SetMenuItemInfoW(menu, id as u32, 0, &mii);
+}
+
+unsafe fn make_dot(opacity: f32) -> HBITMAP {
+    const N: i32 = 16;
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: N, biHeight: -N, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB,
+            ..std::mem::zeroed()
+        },
+        ..std::mem::zeroed()
+    };
+    let mut bits: *mut std::ffi::c_void = null_mut();
+    let bmp = CreateDIBSection(null_mut(), &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if bmp.is_null() || bits.is_null() {
+        return null_mut();
+    }
+    let px = std::slice::from_raw_parts_mut(bits as *mut u32, (N * N) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            let (dx, dy) = (x as f32 + 0.5 - N as f32 / 2.0, y as f32 + 0.5 - N as f32 / 2.0);
+            let a = (N as f32 / 2.0 - 2.0 - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0) * opacity;
+            // Premultiplied ARGB: yellow (255, 200, 0).
+            let c = |v: f32| (v * a) as u32;
+            px[(y * N + x) as usize] = (c(255.0) << 24) | (c(255.0) << 16) | (c(200.0) << 8);
+        }
+    }
+    bmp
+}
+
+/// Menus have no tooltips of their own, so this floats one next to the hovered item.
+unsafe fn show_menu_tip(menu: HMENU, text: &str) {
+    let ctl = with(|s| s.ctl);
+    let mut tip = with(|s| s.menu_tip);
+    if tip.is_null() {
+        tip = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW, TOOLTIPS_CLASSW, null(),
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            ctl, null_mut(), GetModuleHandleW(null()), null(),
+        );
+        with(|s| s.menu_tip = tip);
+    }
+    let mut t = wide(text);
+    let ti = TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_TRACK | TTF_ABSOLUTE,
+        hwnd: ctl,
+        uId: 1,
+        lpszText: t.as_mut_ptr(),
+        ..std::mem::zeroed()
+    };
+    let tool = &ti as *const _ as LPARAM;
+    SendMessageW(tip, TTM_DELTOOLW, 0, tool);
+    SendMessageW(tip, TTM_ADDTOOLW, 0, tool);
+    // Beside the item, on the side with room.
+    let mut item = std::mem::zeroed::<RECT>();
+    for i in 0..GetMenuItemCount(menu) {
+        if GetMenuItemID(menu, i) as usize == ID_FAKE_DATA {
+            GetMenuItemRect(null_mut(), menu, i as u32, &mut item);
+        }
+    }
+    let size = SendMessageW(tip, TTM_GETBUBBLESIZE, 0, tool) as u32;
+    let width = (size & 0xFFFF) as i32;
+    let x = if item.right + 4 + width <= GetSystemMetrics(SM_CXSCREEN) { item.right + 4 } else { item.left - 4 - width };
+    SendMessageW(tip, TTM_TRACKPOSITION, 0, ((item.top as u32 & 0xFFFF) << 16 | (x as u32 & 0xFFFF)) as LPARAM);
+    SendMessageW(tip, TTM_TRACKACTIVATE, 1, tool);
+}
+
+unsafe fn hide_menu_tip() {
+    let tip = with(|s| s.menu_tip);
+    if !tip.is_null() {
+        let ti = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            hwnd: with(|s| s.ctl),
+            uId: 1,
+            ..std::mem::zeroed()
+        };
+        SendMessageW(tip, TTM_TRACKACTIVATE, 0, &ti as *const _ as LPARAM);
+    }
+}
+
 unsafe fn show_menu() {
     let ctl = with(|s| s.ctl);
     let menu = CreatePopupMenu();
@@ -1232,6 +1346,10 @@ unsafe fn show_menu() {
     }
     AppendMenuW(menu, MF_POPUP, accounts as usize, w!("Accounts"));
     AppendMenuW(menu, tick(ID_AUTOSTART), ID_AUTOSTART, w!("Start with Windows"));
+    if DEV {
+        AppendMenuW(menu, tick(ID_FAKE_DATA), ID_FAKE_DATA, w!("Use fake data (dev only)"));
+        set_menu_dot(menu, ID_FAKE_DATA, setting_checked(ID_FAKE_DATA) == Some(true));
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, null());
     AppendMenuW(menu, MF_STRING, ID_REFRESH, w!("Refresh now"));
     AppendMenuW(menu, MF_STRING, ID_OPEN, w!("Open usage page"));
@@ -1316,6 +1434,7 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_ROLL => s.roll,
             ID_HIDE_LABELS => s.hide_labels,
             ID_HIDE_PERCENT => s.hide_percent,
+            ID_FAKE_DATA => s.fake_data,
             ID_ON_LEFT => s.on_left,
             // Ticked limits are shown.
             ID_HIDE_FIVE => !s.hide_five,
@@ -1432,6 +1551,15 @@ fn apply_setting(id: usize) -> bool {
             write_setting("HideLabels", on as u32);
             ensure_widget();
         }
+        ID_FAKE_DATA if DEV => {
+            let on = with(|s| {
+                s.fake_data = !s.fake_data;
+                s.fake_data
+            });
+            write_setting("FakeData", on as u32);
+            // Switch sources right away instead of at the next timer.
+            start_fetch_all();
+        }
         ID_HIDE_PERCENT => {
             let on = with(|s| {
                 s.hide_percent = !s.hide_percent;
@@ -1493,6 +1621,9 @@ unsafe fn refresh_menu(menu: HMENU) {
         let id = GetMenuItemID(menu, i) as usize;
         if let Some(on) = setting_checked(id) {
             CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
+            if id == ID_FAKE_DATA {
+                set_menu_dot(menu, id, on);
+            }
         }
         if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY || id == ID_RING_SPACE {
             // Space around the rings only applies with the numbers inside them.
@@ -1589,6 +1720,16 @@ unsafe extern "system" fn ctl_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 id if id >= T_FETCH_BASE => start_fetch((id - T_FETCH_BASE) as u32),
                 _ => {}
+            }
+            0
+        }
+        WM_MENUSELECT if DEV => {
+            let id = (wp & 0xFFFF) as usize;
+            let flags = ((wp >> 16) & 0xFFFF) as u32;
+            if id == ID_FAKE_DATA && flags & MF_POPUP == 0 && flags != 0xFFFF {
+                show_menu_tip(lp as HMENU, "Prevents rate limits in dev");
+            } else {
+                hide_menu_tip();
             }
             0
         }
