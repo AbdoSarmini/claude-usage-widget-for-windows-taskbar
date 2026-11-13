@@ -1197,7 +1197,10 @@ unsafe fn show_menu() {
     AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));
     AppendMenuW(limits, tick(ID_HIDE_FABLE), ID_HIDE_FABLE, w!("Fable (weekly)"));
     AppendMenuW(custom, MF_POPUP, limits as usize, w!("Show/hide limits"));
-    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, w!("Show on the left side"));
+    // On a vertical taskbar the same setting moves the widget to the top.
+    let vertical = with(|s| s.rendered.as_ref().is_some_and(|k| k.vertical));
+    let side = if vertical { w!("Show on the top") } else { w!("Show on the left side") };
+    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, side);
     // Only matters with more than one account.
     let n_accounts = with(|s| s.accounts.len());
     let per = CreatePopupMenu();
