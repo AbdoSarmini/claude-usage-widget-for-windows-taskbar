@@ -57,6 +57,9 @@ const ID_HIDE_FIVE: usize = 16;
 const ID_HIDE_WEEK: usize = 17;
 const ID_HIDE_FABLE: usize = 18;
 const ID_CLAUDE_ICON: usize = 19;
+const ID_RING_COLOR_ONLY: usize = 20;
+const ID_RING_SPACE: usize = 21;
+const ID_HIDE_PERCENT: usize = 22;
 const ID_ADD_ACCOUNT: usize = 7;
 const ID_REMOVE_BASE: usize = 300; // + index into accounts
 const ID_PER_COL_BASE: usize = 400; // + accounts per column (1 to 3)
@@ -99,6 +102,7 @@ const SETTINGS_KEY: *const u16 = w!("Software\\ClaudeUsageWidget");
 #[derive(Clone, PartialEq)]
 struct RenderKey {
     h: i32,
+    vertical: bool,
     dpi: u32,
     dark: bool,
     hover: bool,
@@ -111,7 +115,10 @@ struct RenderKey {
     pixel_icon: bool,
     rings: bool,
     ring_text: bool,
+    ring_color_only: bool,
+    ring_space: bool,
     hide_labels: bool,
+    hide_percent: bool,
     hide_five: bool,
     hide_week: bool,
     hide_fable: bool,
@@ -169,6 +176,7 @@ struct State {
     hide_icon: bool,
     /// Leave out the `5h` / `W` labels.
     hide_labels: bool,
+    hide_percent: bool,
     /// Sit at the taskbar's left end instead of next to the tray.
     on_left: bool,
     /// Pixel-art mark instead of the asterisk.
@@ -176,6 +184,8 @@ struct State {
     /// A progress ring for each limit, and whether its number sits inside it.
     rings: bool,
     ring_text: bool,
+    ring_color_only: bool,
+    ring_space: bool,
     /// Roll the digits when a number changes.
     roll: bool,
     /// Limits turned off in "Show/hide limits". The 5-hour and Fable groups
@@ -201,7 +211,7 @@ thread_local! {
         taskbar_created_msg: 0, accounts: Vec::new(), next_id: 0,
         hover: false, dark: false, rendered: None, pos: (0, 0, 0, 0),
         interval: DEFAULT_INTERVAL, show_left: false,
-        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
+        font_size: DEFAULT_FONT_SIZE, icon_size: DEFAULT_ICON_SIZE, hide_icon: false, hide_labels: false, hide_percent: false, on_left: false, pixel_icon: false, rings: false, ring_text: false, ring_color_only: false, ring_space: false, roll: false, hide_five: false, hide_week: false, hide_fable: false, rows_per_col: DEFAULT_PER_COL,
         cswap: None, cswap_running: false, update: None, update_busy: None,
     });
 }
@@ -281,10 +291,13 @@ fn main() {
                 .unwrap_or(DEFAULT_FONT_SIZE);
             s.hide_icon = read_setting("HideIcon") == Some(1);
             s.hide_labels = read_setting("HideLabels") == Some(1);
+            s.hide_percent = read_setting("HidePercent") == Some(1);
             s.on_left = read_setting("OnLeft") == Some(1);
             s.pixel_icon = read_setting("PixelIcon") == Some(1);
             s.rings = read_setting("Rings") == Some(1);
             s.ring_text = read_setting("RingText") == Some(1);
+            s.ring_color_only = read_setting("RingColorOnly") == Some(1);
+            s.ring_space = read_setting("RingSpace") == Some(1);
             s.roll = read_setting("RollNumbers") == Some(1);
             s.hide_five = read_setting("HideFiveHour") == Some(1);
             s.hide_week = read_setting("HideWeekly") == Some(1);
@@ -432,8 +445,12 @@ fn ensure_widget() {
         if tray.is_null() || GetWindowRect(tray, &mut tr) == 0 {
             tr = tb;
             tr.left = tb.right;
+            tr.top = tb.bottom;
         }
-        let h = tb.bottom - tb.top;
+        // A vertical taskbar (ExplorerPatcher, Windhawk, Windows 10) is taller than wide:
+        // the widget then stacks its lines and `h` is the bar's width.
+        let vertical = tb.bottom - tb.top > tb.right - tb.left;
+        let h = if vertical { tb.right - tb.left } else { tb.bottom - tb.top };
         let dpi = GetDpiForWindow(taskbar).max(96);
         let scale = dpi as f32 / 96.0;
 
@@ -462,6 +479,7 @@ fn ensure_widget() {
             let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
+                vertical,
                 dpi,
                 dark: s.dark,
                 hover: s.hover,
@@ -479,7 +497,10 @@ fn ensure_widget() {
                 pixel_icon: s.pixel_icon,
                 rings: s.rings,
                 ring_text: s.ring_text,
+                ring_color_only: s.ring_color_only,
+                ring_space: s.ring_space,
                 hide_labels: s.hide_labels,
+                hide_percent: s.hide_percent,
                 hide_five,
                 hide_week: s.hide_week,
                 hide_fable: s.hide_fable,
@@ -496,7 +517,10 @@ fn ensure_widget() {
                 pixel_icon: s.pixel_icon,
                 rings: s.rings,
                 ring_text: s.ring_text,
+                ring_color_only: s.ring_color_only,
+                ring_space: s.ring_space,
                 hide_labels: s.hide_labels,
+                hide_percent: s.hide_percent,
                 hide_five,
                 hide_week: s.hide_week,
                 hide_fable: s.hide_fable,
@@ -506,18 +530,26 @@ fn ensure_widget() {
             (key, changed, model)
         });
 
-        let mut w = with(|s| s.pos.2);
+        let (mut w, mut wh) = with(|s| (s.pos.2, s.pos.3));
         if needs_render {
-            let frame = render::render(&model, h, scale);
+            let frame = render::render(&model, h, scale, vertical.then_some(h));
             w = frame.w;
+            wh = frame.h;
             present(widget, &frame);
             with(|s| s.rendered = Some(key));
         }
 
         let gap = (2.0 * scale) as i32;
-        // The left end is free on a centered taskbar (unless the Widgets button is on).
-        let x = if with(|s| s.on_left) { gap } else { tr.left - tb.left - w - gap };
-        let pos = (x.max(0), 0, w, h);
+        let on_left = with(|s| s.on_left);
+        let pos = if vertical {
+            // Centered across the bar, above the tray, or at the top with "left side".
+            let y = if on_left { gap } else { tr.top - tb.top - wh - gap };
+            (((h - w) / 2).max(0), y.max(0), w, wh)
+        } else {
+            // The left end is free on a centered taskbar (unless the Widgets button is on).
+            let x = if on_left { gap } else { tr.left - tb.left - w - gap };
+            (x.max(0), 0, w, h)
+        };
         let moved = with(|s| {
             let changed = s.pos != pos;
             s.pos = pos;
@@ -1157,16 +1189,25 @@ unsafe fn show_menu() {
     }
     AppendMenuW(icon, MF_POPUP, sizes as usize, w!("Icon size"));
     AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
-    AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
-    AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
+    let rings = CreatePopupMenu();
+    AppendMenuW(rings, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
+    AppendMenuW(rings, MF_SEPARATOR, 0, null());
+    AppendMenuW(rings, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
+    AppendMenuW(rings, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
+    AppendMenuW(rings, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
+    AppendMenuW(custom, MF_POPUP, rings as usize, w!("Usage rings"));
     AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
+    AppendMenuW(custom, tick(ID_HIDE_PERCENT), ID_HIDE_PERCENT, w!("Hide % symbol"));
     let limits = CreatePopupMenu();
     AppendMenuW(limits, tick(ID_HIDE_FIVE), ID_HIDE_FIVE, w!("5-hour"));
     AppendMenuW(limits, tick(ID_HIDE_WEEK), ID_HIDE_WEEK, w!("Weekly"));
     AppendMenuW(limits, tick(ID_HIDE_FABLE), ID_HIDE_FABLE, w!("Fable (weekly)"));
     AppendMenuW(custom, MF_POPUP, limits as usize, w!("Show/hide limits"));
-    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, w!("Show on the left side"));
+    // On a vertical taskbar the same setting moves the widget to the top.
+    let vertical = with(|s| s.rendered.as_ref().is_some_and(|k| k.vertical));
+    let side = if vertical { w!("Show on the top") } else { w!("Show on the left side") };
+    AppendMenuW(custom, tick(ID_ON_LEFT), ID_ON_LEFT, side);
     // Only matters with more than one account.
     let n_accounts = with(|s| s.accounts.len());
     let per = CreatePopupMenu();
@@ -1270,8 +1311,11 @@ fn setting_checked(id: usize) -> Option<bool> {
             ID_SHOW_LEFT => s.show_left,
             ID_RINGS => s.rings,
             ID_RING_TEXT => s.ring_text,
+            ID_RING_COLOR_ONLY => s.ring_color_only,
+            ID_RING_SPACE => s.ring_space,
             ID_ROLL => s.roll,
             ID_HIDE_LABELS => s.hide_labels,
+            ID_HIDE_PERCENT => s.hide_percent,
             ID_ON_LEFT => s.on_left,
             // Ticked limits are shown.
             ID_HIDE_FIVE => !s.hide_five,
@@ -1315,6 +1359,22 @@ fn apply_setting(id: usize) -> bool {
                 s.rings
             });
             write_setting("Rings", on as u32);
+            ensure_widget();
+        }
+        ID_RING_SPACE => {
+            let on = with(|s| {
+                s.ring_space = !s.ring_space;
+                s.ring_space
+            });
+            write_setting("RingSpace", on as u32);
+            ensure_widget();
+        }
+        ID_RING_COLOR_ONLY => {
+            let on = with(|s| {
+                s.ring_color_only = !s.ring_color_only;
+                s.ring_color_only
+            });
+            write_setting("RingColorOnly", on as u32);
             ensure_widget();
         }
         ID_RING_TEXT => {
@@ -1372,6 +1432,14 @@ fn apply_setting(id: usize) -> bool {
             write_setting("HideLabels", on as u32);
             ensure_widget();
         }
+        ID_HIDE_PERCENT => {
+            let on = with(|s| {
+                s.hide_percent = !s.hide_percent;
+                s.hide_percent
+            });
+            write_setting("HidePercent", on as u32);
+            ensure_widget();
+        }
         id @ (ID_HIDE_ICON | ID_CLAUDE_ICON | ID_PIXEL_ICON) => {
             let (hide, pixel) = (id == ID_HIDE_ICON, id == ID_PIXEL_ICON);
             with(|s| {
@@ -1414,7 +1482,7 @@ fn apply_setting(id: usize) -> bool {
     true
 }
 
-/// Brings the ticks up to date, and greys out "Numbers inside the rings" without rings.
+/// Brings the ticks up to date, and greys out the ring options without rings.
 unsafe fn refresh_menu(menu: HMENU) {
     for i in 0..GetMenuItemCount(menu) {
         let sub = GetSubMenu(menu, i);
@@ -1426,8 +1494,9 @@ unsafe fn refresh_menu(menu: HMENU) {
         if let Some(on) = setting_checked(id) {
             CheckMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_CHECKED } else { MF_UNCHECKED });
         }
-        if id == ID_RING_TEXT {
-            let on = with(|s| s.rings);
+        if id == ID_RING_TEXT || id == ID_RING_COLOR_ONLY || id == ID_RING_SPACE {
+            // Space around the rings only applies with the numbers inside them.
+            let on = with(|s| s.rings && (id != ID_RING_SPACE || s.ring_text));
             EnableMenuItem(menu, i as u32, MF_BYPOSITION | if on { MF_ENABLED } else { MF_GRAYED });
         }
     }
