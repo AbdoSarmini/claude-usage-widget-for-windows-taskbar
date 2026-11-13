@@ -1183,10 +1183,13 @@ unsafe fn show_menu() {
     }
     AppendMenuW(icon, MF_POPUP, sizes as usize, w!("Icon size"));
     AppendMenuW(custom, MF_POPUP, icon as usize, w!("Icon"));
-    AppendMenuW(custom, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
-    AppendMenuW(custom, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
-    AppendMenuW(custom, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
-    AppendMenuW(custom, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
+    let rings = CreatePopupMenu();
+    AppendMenuW(rings, tick(ID_RINGS), ID_RINGS, w!("Show usage rings"));
+    AppendMenuW(rings, MF_SEPARATOR, 0, null());
+    AppendMenuW(rings, tick(ID_RING_TEXT), ID_RING_TEXT, w!("Numbers inside the rings"));
+    AppendMenuW(rings, tick(ID_RING_COLOR_ONLY), ID_RING_COLOR_ONLY, w!("Warning colors on the rings only"));
+    AppendMenuW(rings, tick(ID_RING_SPACE), ID_RING_SPACE, w!("Space around the rings (small taskbars)"));
+    AppendMenuW(custom, MF_POPUP, rings as usize, w!("Usage rings"));
     AppendMenuW(custom, tick(ID_ROLL), ID_ROLL, w!("Roll numbers when they change"));
     AppendMenuW(custom, tick(ID_HIDE_LABELS), ID_HIDE_LABELS, w!("Hide labels"));
     let limits = CreatePopupMenu();
