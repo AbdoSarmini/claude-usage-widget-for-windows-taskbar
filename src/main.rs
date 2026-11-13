@@ -99,6 +99,7 @@ const SETTINGS_KEY: *const u16 = w!("Software\\ClaudeUsageWidget");
 #[derive(Clone, PartialEq)]
 struct RenderKey {
     h: i32,
+    vertical: bool,
     dpi: u32,
     dark: bool,
     hover: bool,
@@ -432,8 +433,12 @@ fn ensure_widget() {
         if tray.is_null() || GetWindowRect(tray, &mut tr) == 0 {
             tr = tb;
             tr.left = tb.right;
+            tr.top = tb.bottom;
         }
-        let h = tb.bottom - tb.top;
+        // A vertical taskbar (ExplorerPatcher, Windhawk, Windows 10) is taller than wide:
+        // the widget then stacks its lines and `h` is the bar's width.
+        let vertical = tb.bottom - tb.top > tb.right - tb.left;
+        let h = if vertical { tb.right - tb.left } else { tb.bottom - tb.top };
         let dpi = GetDpiForWindow(taskbar).max(96);
         let scale = dpi as f32 / 96.0;
 
@@ -462,6 +467,7 @@ fn ensure_widget() {
             let hide_five = s.hide_five || (loaded.peek().is_some() && loaded.all(|u| !u.has_five_hour));
             let key = RenderKey {
                 h,
+                vertical,
                 dpi,
                 dark: s.dark,
                 hover: s.hover,
@@ -506,18 +512,26 @@ fn ensure_widget() {
             (key, changed, model)
         });
 
-        let mut w = with(|s| s.pos.2);
+        let (mut w, mut wh) = with(|s| (s.pos.2, s.pos.3));
         if needs_render {
-            let frame = render::render(&model, h, scale);
+            let frame = render::render(&model, h, scale, vertical.then_some(h));
             w = frame.w;
+            wh = frame.h;
             present(widget, &frame);
             with(|s| s.rendered = Some(key));
         }
 
         let gap = (2.0 * scale) as i32;
-        // The left end is free on a centered taskbar (unless the Widgets button is on).
-        let x = if with(|s| s.on_left) { gap } else { tr.left - tb.left - w - gap };
-        let pos = (x.max(0), 0, w, h);
+        let on_left = with(|s| s.on_left);
+        let pos = if vertical {
+            // Centered across the bar, above the tray, or at the top with "left side".
+            let y = if on_left { gap } else { tr.top - tb.top - wh - gap };
+            (((h - w) / 2).max(0), y.max(0), w, wh)
+        } else {
+            // The left end is free on a centered taskbar (unless the Widgets button is on).
+            let x = if on_left { gap } else { tr.left - tb.left - w - gap };
+            (x.max(0), 0, w, h)
+        };
         let moved = with(|s| {
             let changed = s.pos != pos;
             s.pos = pos;

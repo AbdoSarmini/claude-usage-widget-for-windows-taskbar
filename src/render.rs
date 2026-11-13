@@ -176,19 +176,38 @@ struct Ring {
 }
 
 struct Divider {
-    x: i32,
+    x0: i32,
+    x1: i32,
     y0: i32,
     y1: i32,
 }
 
-/// Renders the widget for a taskbar of height `h` at `scale` (DPI / 96).
-pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
+/// Renders the widget for a taskbar of height `h` at `scale` (DPI / 96), or with
+/// `vert = Some(width)` for a vertical taskbar: one line per limit, stacked under
+/// the icon, shrunk until it fits that width.
+pub fn render(m: &Model, h: i32, scale: f32, vert: Option<i32>) -> Frame {
+    let Some(avail) = vert else { return layout(m, h, scale, false) };
+    let mut k = 1.0;
+    loop {
+        let f = layout(m, 0, scale * k, true);
+        if f.w <= avail || k < 0.4 {
+            return f;
+        }
+        k *= avail as f32 / f.w as f32 * 0.97;
+    }
+}
+
+/// `vertical`: `h` is unused and the height follows the content.
+fn layout(m: &Model, h: i32, scale: f32, vertical: bool) -> Frame {
     let pal = palette(m.dark);
     let s = |v: f32| (v * scale).round() as i32;
+    // Vertical lines are sized as on a 32 px tall taskbar.
+    let mut h = if vertical { s(32.0) } else { h };
     let empty = [Row { five: None, week: None, fable: None, roll: None, stale: false }];
     let rows: &[Row] = if m.rows.is_empty() { &empty } else { &m.rows };
-    let rows_per_col = m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN);
-    let per_col = rows.len().min(rows_per_col);
+    // Vertical: every account in one column, one line per limit.
+    let rows_per_col = if vertical { rows.len() } else { m.rows_per_col.clamp(1, MAX_ROWS_PER_COLUMN) };
+    let per_col = if vertical { 1 } else { rows.len().min(rows_per_col) };
     // One account uses the full height like before; stacked accounts share
     // it, with a small margin, and the text shrinks to fit.
     let (band_top, row_h) = if per_col == 1 {
@@ -243,8 +262,15 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         let div_h = if per_col == 1 { s(20.0) } else { (row_h as i32 - s(2.0)).max(1) };
 
         let mut x = pad_l;
-        let icon_x = x;
-        x += icon + gap_icon;
+        let mut icon_x = x;
+        let pad_v = s(6.0);
+        // Vertical: the icon gets a line of its own, then each limit one line.
+        let mut y = pad_v + if icon > 0 { icon + pad_v } else { 0 };
+        let line_h = ((font_px as f32 * 1.6).round() as i32).max(ring_d + s(4.0));
+        let mut hlines = Vec::new();
+        if !vertical {
+            x += icon + gap_icon;
+        }
         let mut segs = Vec::new();
         let mut dividers = Vec::new();
         let mut rings = Vec::new();
@@ -260,7 +286,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                 .filter_map(|(k, on)| on.then_some(k))
                 .collect();
             let groups = ids.len();
-            let label_w: Vec<i32> = ids
+            let mut label_w: Vec<i32> = ids
                 .iter()
                 .map(|&k| &labels[k])
                 .map(|l| if m.hide_labels { 0 } else { measure(l, f_label) })
@@ -275,15 +301,23 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                     value_w[g] = value_w[g].max(measure(&v[g], if inside { f_small } else { f_value }));
                 }
             }
-            let mut group_x = vec![0; groups];
+            let mut group_x = vec![pad_l; groups];
             let mut div_x = vec![0; groups];
-            for g in 0..groups {
-                group_x[g] = x;
-                x += label_w[g] + gap_lv + if inside { ring_d } else { ring_d + ring_gap + value_w[g] } + gap_div;
-                div_x[g] = x;
-                x += div_w;
-                if g + 1 < groups {
-                    x += gap_div;
+            if vertical {
+                // Labels share the widest label's width so the values line up.
+                let lw = label_w.iter().copied().max().unwrap_or(0);
+                label_w.iter_mut().for_each(|l| *l = lw);
+                let vw = value_w.iter().copied().max().unwrap_or(0);
+                x = pad_l + lw + gap_lv + if inside { ring_d } else { ring_d + ring_gap + vw };
+            } else {
+                for g in 0..groups {
+                    group_x[g] = x;
+                    x += label_w[g] + gap_lv + if inside { ring_d } else { ring_d + ring_gap + value_w[g] } + gap_div;
+                    div_x[g] = x;
+                    x += div_w;
+                    if g + 1 < groups {
+                        x += gap_div;
+                    }
                 }
             }
             for (ri, (row, vals)) in col.iter().zip(&values).enumerate() {
@@ -298,12 +332,20 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                     None => (1.0, 0.0),
                 };
                 for g in 0..groups {
+                    let (y0, y1) = if vertical {
+                        y += line_h;
+                        (y - line_h, y)
+                    } else {
+                        (y0, y1)
+                    };
                     let val = [row.five, row.week, row.fable][ids[g]];
                     if !m.hide_labels {
                         segs.push(Seg { text: labels[ids[g]].clone(), bold: false, small: false, x: group_x[g], w: label_w[g], y0, y1, color: pal.label, blur: 0, slack: s(2.0) });
                     }
                     let dy = y0 + ((y1 - y0) - div_h) / 2;
-                    dividers.push(Divider { x: div_x[g], y0: dy.max(0), y1: (dy + div_h).min(h) });
+                    if !vertical {
+                        dividers.push(Divider { x0: div_x[g], x1: div_x[g] + div_w, y0: dy.max(0), y1: (dy + div_h).min(h) });
+                    }
                     let content_x = group_x[g] + label_w[g] + gap_lv;
                     let color = value_color(val, &pal);
                     if m.rings {
@@ -367,12 +409,24 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
                         }
                     }
                 }
+                if vertical && ri + 1 < col.len() {
+                    // A rule between accounts.
+                    hlines.push(y + gap_div / 2);
+                    y += gap_div;
+                }
             }
             if ci + 1 < columns.len() {
                 x += gap_div;
             }
         }
-        let w = x + pad_r;
+        let w = if vertical { x + pad_l } else { x + pad_r };
+        if vertical {
+            h = y + pad_v;
+            icon_x = (w - icon) / 2;
+            for &hy in &hlines {
+                dividers.push(Divider { x0: pad_l, x1: w - pad_l, y0: hy, y1: hy + div_w });
+            }
+        }
 
         // Text mask: white text on black.
         let bmi = BITMAPINFO {
@@ -441,7 +495,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         // Dividers.
         for d in &dividers {
             for y in d.y0..d.y1 {
-                for xx in d.x..d.x + div_w {
+                for xx in d.x0..d.x1 {
                     over(&mut buf, (y * w + xx) as usize, pal.divider, 1.0);
                 }
             }
@@ -476,7 +530,7 @@ pub fn render(m: &Model, h: i32, scale: f32) -> Frame {
         }
 
         // Claude mark.
-        let iy = (h - icon) / 2;
+        let iy = if vertical { pad_v } else { (h - icon) / 2 };
         let mark = if m.pixel_icon { draw_pixel_mark(icon) } else { draw_mark(icon) };
         for y in 0..icon {
             for xx in 0..icon {
