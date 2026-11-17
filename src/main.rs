@@ -261,6 +261,7 @@ fn main() {
         if let Ok(exe) = std::env::current_exe() {
             std::thread::spawn(move || update::clean_up_old(&exe));
         }
+        repoint_autostart();
         // The folder picker needs COM on this thread.
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let hinst = GetModuleHandleW(null());
@@ -930,6 +931,43 @@ fn autostart_enabled() -> bool {
     unsafe {
         RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ,
             null_mut(), null_mut(), &mut size) == ERROR_SUCCESS
+    }
+}
+
+/// The command line "Start with Windows" runs, if it's on.
+fn autostart_command() -> Option<String> {
+    let mut size = 0u32;
+    unsafe {
+        if RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ,
+            null_mut(), null_mut(), &mut size) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let mut buf = vec![0u16; size as usize / 2 + 1];
+        size = (buf.len() * 2) as u32;
+        if RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ,
+            null_mut(), buf.as_mut_ptr() as *mut _, &mut size) != ERROR_SUCCESS
+        {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..len]))
+    }
+}
+
+/// If "Start with Windows" is on but points at another exe (an older copy
+/// downloaded to a different name or folder), points it at this one, so a
+/// reboot doesn't bring the old version back. Dev builds leave it alone so
+/// testing doesn't take over the installed copy's autostart.
+fn repoint_autostart() {
+    if DEV {
+        return;
+    }
+    let Some(cmd) = autostart_command() else { return };
+    let Ok(exe) = std::env::current_exe() else { return };
+    let current = format!("\"{}\"", exe.display());
+    if !cmd.trim().eq_ignore_ascii_case(&current) {
+        set_autostart(true);
     }
 }
 
